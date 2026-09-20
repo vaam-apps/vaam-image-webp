@@ -28,6 +28,13 @@ byteorder-lite = "0.1.0"
 quick-error = "2.0.1"
 
 [dev-dependencies]
+# `webp` (libwebp) and `dssim-core` back examples/rd_eval.rs, which measures
+# this crate's lossy encoder against libwebp at matched perceptual quality.
+# Dev-only: neither is linked into the library, so downstreams that depend on
+# this crate to avoid C do not get libwebp through it.
+dssim-core = "3.5"
+rgb = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
 paste = "1.0.14"
 png = "0.17.12"
 rand = "0.8.5"
