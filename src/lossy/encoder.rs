@@ -69,6 +69,98 @@ type LumaYCoeffs = [i32; 16 * 16];
 
 type ChromaCoeffs = [i32; 16 * 4];
 
+// --- Rate-distortion mode decision ------------------------------------------
+//
+// `choose_macroblock_info` picks, for each macroblock, the 16x16 luma
+// prediction mode and chroma prediction mode that minimise a Lagrangian cost
+// `distortion + lambda * rate`, instead of the fixed DC/DC choice the encoder
+// used to make unconditionally. See `choose_macroblock_info` for the search
+// itself and `mode_decision_lambda` for how `lambda` is derived.
+
+/// Cheap proxy for the number of bits a block of quantized coefficients will
+/// cost to entropy-code, used as the rate term in RD mode decision.
+///
+/// A full model would run the actual token tree (`DCT_TOKEN_TREE`) and sum
+/// `-log2(prob)` per bit, which is expensive to do for every candidate mode
+/// of every macroblock. Instead we count, per nonzero coefficient, 1 (for the
+/// token-tree traversal that signals "nonzero", which costs roughly a
+/// constant number of bits regardless of magnitude) plus the coefficient's
+/// absolute level (because larger levels need more extra bits: literals 1-4
+/// cost a handful of tree bits, but categories DCT_CAT1..6 add 1-11 explicit
+/// sign/magnitude bits whose count grows with `log2(level)` - a linear
+/// over-estimate in `level`, but one that preserves the right ordering
+/// between "one big coefficient" and "several small ones", which is what
+/// mode decision actually needs). This tracks real token cost closely enough
+/// in practice (see the rd_eval numbers in the commit message) without
+/// needing the token tree at all.
+fn coeff_rate_estimate(coeffs: &[i32]) -> i64 {
+    coeffs
+        .iter()
+        .filter(|&&c| c != 0)
+        .map(|&c| 1 + i64::from(c.abs()))
+        .sum()
+}
+
+// Empirically tuned multiplier for `mode_decision_lambda`, see there for the
+// derivation. Calibrated against `examples/rd_eval` on the Kodak corpus.
+const LAMBDA_SCALE: f64 = 0.02;
+
+/// Lagrangian multiplier for RD mode decision: `cost = distortion + lambda *
+/// rate`.
+///
+/// Distortion here is sum-of-squared-error (SSE) in the pixel domain, and
+/// rate is `coeff_rate_estimate`'s coefficient-count-based proxy. Classical
+/// rate-distortion theory (Sullivan & Wiegand, "Rate-Distortion Optimization
+/// for Video Compression", IEEE Signal Processing Magazine, 1998) derives,
+/// for SSD-based distortion against a real bit-rate cost, `lambda = c *
+/// Qstep^2`: the quantizer step controls both how much squared error a given
+/// residual leaves (variance ~ Qstep^2/12 per coefficient) and how many bits
+/// a one-step change in level costs, so both distortion and marginal rate
+/// scale with the same step, and lambda (their ratio at the RD-optimal point)
+/// scales with its square.
+///
+/// We use the macroblock's luma AC quantizer step (`segment.yac`) as
+/// `Qstep`, since AC coefficients dominate both the coefficient count and
+/// the typical energy in a block, and this crate does not yet do
+/// per-macroblock quantizer search (segments are unused beyond segment 0),
+/// so it is the one step size that is actually representative here.
+///
+/// The classical bit-domain constant (`c ~= 0.85`) assumes rate is measured
+/// in real bits; our `coeff_rate_estimate` proxy is in "coefficient units"
+/// (roughly `nonzero_count + sum(|level|)`), which is systematically larger
+/// than the real bit cost for the same block (see its doc comment), so the
+/// same distortion/rate tradeoff needs a smaller multiplier. `LAMBDA_SCALE`
+/// is that multiplier, picked empirically by sweeping it against
+/// `examples/rd_eval` on the Kodak corpus and taking the value that
+/// minimised the median ours/libwebp size ratio - not re-derived from first
+/// principles, since the proxy itself is heuristic.
+fn mode_decision_lambda(segment: &Segment) -> f64 {
+    let qstep = f64::from(segment.yac);
+    LAMBDA_SCALE * qstep * qstep
+}
+
+/// `prob_skip_false` (9.10/19.2 in the spec) is the probability, scaled to a
+/// byte, that a macroblock's `coeffs_skipped` flag is *false* - i.e. that it
+/// is NOT skipped. It only affects how many bits the flag itself costs, not
+/// correctness (the arithmetic coder is exact for any probability in
+/// 1..=255), so getting it close to the real skip rate is a compression
+/// efficiency question, not a correctness one. We measure the real rate via
+/// `Vp8Encoder::count_skipped_macroblocks` rather than guessing, since mode
+/// decision has to run once for real regardless and re-running it once more
+/// dry is cheap by comparison.
+fn skip_probability(skipped: u32, total: u32) -> u8 {
+    if total == 0 {
+        return 128;
+    }
+    let not_skipped = u64::from(total - skipped);
+    // round-to-nearest rather than truncating, and keep clear of the 0/256
+    // edges: a probability of exactly 0 (or a raw 256) isn't representable
+    // in a u8, and either extreme just means "one branch never happens
+    // here", which 1 / 255 already expresses for all practical purposes.
+    let scaled = (256 * not_skipped + u64::from(total) / 2) / u64::from(total);
+    scaled.clamp(1, 255) as u8
+}
+
 struct Vp8Encoder<W> {
     writer: W,
     frame: Frame,
@@ -638,6 +730,15 @@ impl<W: Write> Vp8Encoder<W> {
 
         self.setup_encoding(lossy_quality, width, height, y_bytes, u_bytes, v_bytes);
 
+        // Learn the real skip rate before writing the frame header, which is
+        // where `prob_skip_false` has to go (9.10/19.2) - it comes before any
+        // macroblock data in the bitstream. See `count_skipped_macroblocks`
+        // and `skip_probability` for why this dry run is both correct and
+        // worth its cost.
+        let (skipped, total) = self.count_skipped_macroblocks();
+        self.reset_frame_state();
+        self.macroblock_no_skip_coeff = Some(skip_probability(skipped, total));
+
         self.encode_compressed_frame_header();
 
         // encode residual partitions first
@@ -657,16 +758,25 @@ impl<W: Write> Vp8Encoder<W> {
                 // write macroblock headers
                 self.write_macroblock_header(&macroblock_info, mbx.into());
 
+                // Reconstruction always has to run, skipped or not: even a
+                // skipped macroblock's borders (what the *next* macroblock
+                // predicts from) are the prediction with a zero residual
+                // added, which is exactly what `transform_luma_block` /
+                // `transform_chroma_blocks` compute - the decoder does the
+                // same thing unconditionally (`decode_frame_` in mod.rs always
+                // calls `intra_predict_luma`/`intra_predict_chroma`, just with
+                // an all-zero coefficient block when `coeffs_skipped`). Only
+                // the bit-writing below is conditional.
+                let y_block_data =
+                    self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info);
+
+                let (u_block_data, v_block_data) = self.transform_chroma_blocks(
+                    mbx.into(),
+                    mby.into(),
+                    macroblock_info.chroma_mode,
+                );
+
                 if !macroblock_info.coeffs_skipped {
-                    let y_block_data =
-                        self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info);
-
-                    let (u_block_data, v_block_data) = self.transform_chroma_blocks(
-                        mbx.into(),
-                        mby.into(),
-                        macroblock_info.chroma_mode,
-                    );
-
                     self.encode_residual_data(
                         &macroblock_info,
                         partition_index,
@@ -698,17 +808,246 @@ impl<W: Write> Vp8Encoder<W> {
         Ok(())
     }
 
-    fn choose_macroblock_info(&self, _mbx: usize, _mby: usize) -> MacroblockInfo {
-        let (luma_mode, luma_bpred) = (LumaMode::DC, None);
-        let chroma_mode = ChromaMode::DC;
+    /// The four "whole macroblock" luma prediction modes considered by RD
+    /// mode decision. `LumaMode::B` (independent 4x4 sub-block prediction)
+    /// is not a candidate here: it needs its own per-block search with
+    /// `left_b_pred`/`top_b_pred` context tracking, which is a separate,
+    /// optional phase (see the module's design notes in the commit history).
+    const LUMA_MODE_CANDIDATES: [LumaMode; 4] =
+        [LumaMode::DC, LumaMode::V, LumaMode::H, LumaMode::TM];
+
+    const CHROMA_MODE_CANDIDATES: [ChromaMode; 4] =
+        [ChromaMode::DC, ChromaMode::V, ChromaMode::H, ChromaMode::TM];
+
+    /// Picks the luma and chroma prediction modes for one macroblock by
+    /// Lagrangian RD cost (`distortion + lambda * rate`, see
+    /// `mode_decision_lambda`), and whether the macroblock can be signalled
+    /// as skipped (all quantized coefficients zero).
+    ///
+    /// This method is deliberately `&self`, not `&mut self`: every trial
+    /// below runs predict -> residual -> DCT -> quantize -> dequantize ->
+    /// IDCT -> reconstruct against *local* copies of the prediction buffers,
+    /// and reads `top_border_*` / `left_border_*` / `self.frame` without
+    /// touching them. The real, state-mutating version of this pipeline
+    /// (`transform_luma_block` / `transform_chroma_blocks`) runs exactly
+    /// once per macroblock, in `encode_image`, using the mode this function
+    /// returns - so the borders the *next* macroblock predicts from are
+    /// always the actual reconstruction of the chosen mode, never a trial.
+    fn choose_macroblock_info(&self, mbx: usize, mby: usize) -> MacroblockInfo {
+        let segment = self.segments[0];
+        let lambda = mode_decision_lambda(&segment);
+
+        let mut best_luma: Option<(f64, LumaMode, Luma16x16Coeffs)> = None;
+        for &mode in &Self::LUMA_MODE_CANDIDATES {
+            let (distortion, rate, coeffs) = self.trial_luma_16x16(mode, mbx, mby, &segment);
+            let cost = distortion as f64 + lambda * rate as f64;
+            let better = match &best_luma {
+                None => true,
+                Some((best_cost, ..)) => cost < *best_cost,
+            };
+            if better {
+                best_luma = Some((cost, mode, coeffs));
+            }
+        }
+        let (_, luma_mode, luma_coeffs) =
+            best_luma.expect("LUMA_MODE_CANDIDATES is non-empty");
+
+        let mut best_chroma: Option<(f64, ChromaMode, ChromaCoeffs, ChromaCoeffs)> = None;
+        for &mode in &Self::CHROMA_MODE_CANDIDATES {
+            let (distortion, rate, u_coeffs, v_coeffs) = self.trial_chroma(mode, mbx, mby);
+            let cost = distortion as f64 + lambda * rate as f64;
+            let better = match &best_chroma {
+                None => true,
+                Some((best_cost, ..)) => cost < *best_cost,
+            };
+            if better {
+                best_chroma = Some((cost, mode, u_coeffs, v_coeffs));
+            }
+        }
+        let (_, chroma_mode, u_coeffs, v_coeffs) =
+            best_chroma.expect("CHROMA_MODE_CANDIDATES is non-empty");
+
+        // The macroblock can be signalled as skipped iff the chosen modes
+        // leave every quantized coefficient at zero - luma AC (`y_coeffs`),
+        // luma DC-of-each-block (`y2_coeffs`, since luma_mode is never B
+        // here), and both chroma planes. `write_macroblock_header` /
+        // `encode_image` are what actually act on this flag; this is purely
+        // "would every block we're about to write be empty".
+        let coeffs_skipped = luma_coeffs.y2_coeffs.iter().all(|&c| c == 0)
+            && luma_coeffs.y_coeffs.iter().all(|&c| c == 0)
+            && u_coeffs.iter().all(|&c| c == 0)
+            && v_coeffs.iter().all(|&c| c == 0);
 
         MacroblockInfo {
             luma_mode,
-            luma_bpred,
+            luma_bpred: None,
             chroma_mode,
             segment_id: None,
-            coeffs_skipped: false,
+            coeffs_skipped,
         }
+    }
+
+    /// RD trial for one candidate 16x16 luma prediction mode: predicts,
+    /// takes the residual against the source, DCTs, quantizes, and then
+    /// dequantizes/IDCTs/reconstructs *into a local buffer* to measure how
+    /// close the reconstruction gets (distortion) and how expensive its
+    /// coefficients are (rate). Never mutates `self`.
+    fn trial_luma_16x16(
+        &self,
+        luma_mode: LumaMode,
+        mbx: usize,
+        mby: usize,
+        segment: &Segment,
+    ) -> (i64, i64, Luma16x16Coeffs) {
+        let y_with_border = self.get_predicted_luma_block_16x16(luma_mode, mbx, mby);
+        let luma_blocks = self.get_luma_blocks_from_predicted_16x16(&y_with_border, mbx, mby);
+        let mut coeffs = self.get_luma_block_coeffs_16x16(luma_blocks, segment);
+        let dequantized_blocks = self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs);
+
+        // Reconstruct into a copy of the predicted block so this trial never
+        // touches `self.top_border_y` / `self.left_border_y`.
+        let mut recon = y_with_border;
+        for y in 0usize..4 {
+            for x in 0usize..4 {
+                let i = x + y * 4;
+                let rb: &[i32; 16] = dequantized_blocks[i * 16..][..16].try_into().unwrap();
+                add_residue(&mut recon, rb, 1 + y * 4, 1 + x * 4, LUMA_STRIDE);
+            }
+        }
+
+        let distortion = self.luma_sse(&recon, mbx, mby);
+        let rate = coeff_rate_estimate(&coeffs.y2_coeffs) + coeff_rate_estimate(&coeffs.y_coeffs);
+
+        (distortion, rate, coeffs)
+    }
+
+    /// Sum of squared error between a trial reconstruction of a 16x16 luma
+    /// macroblock (as produced by `trial_luma_16x16`, still carrying its
+    /// 1-pixel border) and the true source pixels.
+    fn luma_sse(&self, recon: &[u8; LUMA_BLOCK_SIZE], mbx: usize, mby: usize) -> i64 {
+        let stride = LUMA_STRIDE;
+        let width = usize::from(self.macroblock_width) * 16;
+        let mut sse: i64 = 0;
+        for y in 0..16 {
+            for x in 0..16 {
+                let r = i64::from(recon[(y + 1) * stride + (x + 1)]);
+                let a = i64::from(self.frame.ybuf[(mby * 16 + y) * width + mbx * 16 + x]);
+                let d = r - a;
+                sse += d * d;
+            }
+        }
+        sse
+    }
+
+    /// RD trial for one candidate chroma prediction mode, covering both U
+    /// and V (a macroblock has a single `ChromaMode` shared by both planes).
+    /// Same shape as `trial_luma_16x16`: never mutates `self`.
+    fn trial_chroma(
+        &self,
+        chroma_mode: ChromaMode,
+        mbx: usize,
+        mby: usize,
+    ) -> (i64, i64, ChromaCoeffs, ChromaCoeffs) {
+        let mut predicted_u = self.get_predicted_chroma_block(
+            chroma_mode,
+            mbx,
+            mby,
+            &self.top_border_u,
+            &self.left_border_u,
+        );
+        let mut predicted_v = self.get_predicted_chroma_block(
+            chroma_mode,
+            mbx,
+            mby,
+            &self.top_border_v,
+            &self.left_border_v,
+        );
+
+        let u_blocks =
+            self.get_chroma_blocks_from_predicted(&predicted_u, &self.frame.ubuf, mbx, mby);
+        let v_blocks =
+            self.get_chroma_blocks_from_predicted(&predicted_v, &self.frame.vbuf, mbx, mby);
+
+        let u_coeffs = self.get_chroma_block_coeffs(u_blocks);
+        let v_coeffs = self.get_chroma_block_coeffs(v_blocks);
+
+        let dequantized_u = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs);
+        let dequantized_v = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs);
+
+        for y in 0usize..2 {
+            for x in 0usize..2 {
+                let i = x + y * 2;
+                let urb: &[i32; 16] = dequantized_u[i * 16..][..16].try_into().unwrap();
+                add_residue(&mut predicted_u, urb, 1 + y * 4, 1 + x * 4, CHROMA_STRIDE);
+
+                let vrb: &[i32; 16] = dequantized_v[i * 16..][..16].try_into().unwrap();
+                add_residue(&mut predicted_v, vrb, 1 + y * 4, 1 + x * 4, CHROMA_STRIDE);
+            }
+        }
+
+        let distortion = self.chroma_sse(&predicted_u, &self.frame.ubuf, mbx, mby)
+            + self.chroma_sse(&predicted_v, &self.frame.vbuf, mbx, mby);
+        let rate = coeff_rate_estimate(&u_coeffs) + coeff_rate_estimate(&v_coeffs);
+
+        (distortion, rate, u_coeffs, v_coeffs)
+    }
+
+    /// Sum of squared error between a trial reconstruction of one 8x8 chroma
+    /// plane (still carrying its 1-pixel border) and the true source pixels
+    /// of that plane (`self.frame.ubuf` or `self.frame.vbuf`).
+    fn chroma_sse(&self, recon: &[u8; CHROMA_BLOCK_SIZE], plane: &[u8], mbx: usize, mby: usize) -> i64 {
+        let stride = CHROMA_STRIDE;
+        let chroma_width = usize::from(self.macroblock_width) * 8;
+        let mut sse: i64 = 0;
+        for y in 0..8 {
+            for x in 0..8 {
+                let r = i64::from(recon[(y + 1) * stride + (x + 1)]);
+                let a = i64::from(plane[(mby * 8 + y) * chroma_width + mbx * 8 + x]);
+                let d = r - a;
+                sse += d * d;
+            }
+        }
+        sse
+    }
+
+    /// Dry run of the whole frame's macroblock loop - mode decision plus the
+    /// real, state-mutating reconstruction - counting what fraction of
+    /// macroblocks end up skippable, without writing any header or residual
+    /// bits. Used only to pick `prob_skip_false` (see `skip_probability`)
+    /// before the frame header is written, since that header comes before
+    /// any macroblock data in the bitstream and so has to be decided upfront.
+    ///
+    /// This intentionally reuses `choose_macroblock_info` /
+    /// `transform_luma_block` / `transform_chroma_blocks` verbatim rather
+    /// than re-implementing a cheaper estimate: mode decision only depends
+    /// on pixel data and border state, never on entropy-coding
+    /// probabilities, so the skip decisions made here are exactly the ones
+    /// the real pass will make. The border/b_pred/complexity state this
+    /// mutates is fully reset by `reset_frame_state` immediately afterwards.
+    fn count_skipped_macroblocks(&mut self) -> (u32, u32) {
+        let mut total = 0u32;
+        let mut skipped = 0u32;
+
+        for mby in 0..self.macroblock_height {
+            self.left_complexity = Complexity::default();
+            self.left_b_pred = [IntraMode::default(); 4];
+            self.left_border_y = [129u8; 16 + 1];
+            self.left_border_u = [129u8; 8 + 1];
+            self.left_border_v = [129u8; 8 + 1];
+
+            for mbx in 0..self.macroblock_width {
+                let info = self.choose_macroblock_info(mbx.into(), mby.into());
+                self.transform_luma_block(mbx.into(), mby.into(), &info);
+                self.transform_chroma_blocks(mbx.into(), mby.into(), info.chroma_mode);
+
+                total += 1;
+                if info.coeffs_skipped {
+                    skipped += 1;
+                }
+            }
+        }
+
+        (skipped, total)
     }
 
     // sets up the encoding of the encoder by setting all the encoder params based on the width and height
@@ -744,10 +1083,6 @@ impl<W: Write> Vp8Encoder<W> {
             sharpness_level: 7,
         };
 
-        self.top_complexity = vec![Complexity::default(); usize::from(mb_width)];
-        self.top_b_pred = vec![IntraMode::default(); 4 * usize::from(mb_width)];
-        self.left_b_pred = [IntraMode::default(); 4];
-
         self.token_probs = COEFF_PROBS;
 
         // choosing the quantization quality based on the quality passed in
@@ -776,13 +1111,29 @@ impl<W: Write> Vp8Encoder<W> {
         };
         self.segments[0] = segment;
 
+        self.reset_frame_state();
+    }
+
+    /// Resets every piece of per-frame encoding state that prediction reads
+    /// (borders, B_PRED context, coefficient complexity) back to its
+    /// initial, "no macroblocks encoded yet" values. Called both from
+    /// `setup_encoding` (first use) and from `encode_image` after the dry
+    /// `count_skipped_macroblocks` pass (which mutates all of this exactly
+    /// like the real pass would, and must not leak into it).
+    fn reset_frame_state(&mut self) {
+        let mb_width = self.macroblock_width;
+
+        self.top_complexity = vec![Complexity::default(); usize::from(mb_width)];
+        self.top_b_pred = vec![IntraMode::default(); 4 * usize::from(mb_width)];
+        self.left_b_pred = [IntraMode::default(); 4];
+
         self.left_border_y = [129u8; 16 + 1];
         self.left_border_u = [129u8; 8 + 1];
         self.left_border_v = [129u8; 8 + 1];
 
-        self.top_border_y = vec![127u8; usize::from(self.macroblock_width) * 16 + 4];
-        self.top_border_u = vec![127u8; usize::from(self.macroblock_width) * 8];
-        self.top_border_v = vec![127u8; usize::from(self.macroblock_width) * 8];
+        self.top_border_y = vec![127u8; usize::from(mb_width) * 16 + 4];
+        self.top_border_u = vec![127u8; usize::from(mb_width) * 8];
+        self.top_border_v = vec![127u8; usize::from(mb_width) * 8];
     }
 
     // this is for all the luma modes except B
