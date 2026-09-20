@@ -1,16 +1,27 @@
 [package]
-name = "image-webp"
-version = "0.2.4"
+name = "vaam-image-webp"
+version = "0.3.0-vaam.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.80.1"
 
-description = "WebP encoding and decoding in pure Rust"
-homepage = "https://github.com/image-rs/image-webp"
-repository = "https://github.com/image-rs/image-webp"
+description = "WebP encoding and decoding in pure Rust - vaam-apps fork of image-webp, tracking its unreleased lossy (VP8) encoder"
+homepage = "https://github.com/vaam-apps/vaam-image-webp"
+repository = "https://github.com/vaam-apps/vaam-image-webp"
 categories = ["multimedia::images", "multimedia::encoding", "encoding"]
 
 include = ["/src", "LICENSE-APACHE", "LICENSE-MIT", "README.md"]
+
+# The *package* is renamed (vaam-image-webp) but the Rust *lib target* keeps
+# upstream's `image_webp` name deliberately. This fork exists only to track
+# upstream's unreleased lossy VP8 encoder until it ships in a crates.io
+# release; renaming the lib target would rewrite every `use image_webp::...`
+# in tests/ and benches/ and turn each one into a merge conflict on every
+# future upstream pull, for no benefit. Downstreams write
+# `vaam-image-webp = { git = ... }` and `use image_webp::...`.
+[lib]
+name = "image_webp"
+path = "src/lib.rs"
 
 [dependencies]
 byteorder-lite = "0.1.0"

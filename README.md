@@ -1,3 +1,28 @@
+> ### About this fork
+>
+> `vaam-image-webp` is [vaam-apps](https://github.com/vaam-apps)' fork of
+> [`image-rs/image-webp`](https://github.com/image-rs/image-webp), maintained for
+> [`vaam-store/image-resizer`](https://github.com/vaam-store/image-resizer) (EmgR).
+>
+> **Why it exists:** EmgR has no C or C++ dependencies. That rules out `libwebp`,
+> which leaves lossy WebP encoding with no published pure-Rust implementation —
+> `image-webp` 0.2.4, the newest release on crates.io, encodes losslessly only, and
+> lossless WebP runs roughly 5–12x larger than lossy on photographic content.
+>
+> Upstream's `main` branch *does* have a working lossy VP8 encoder (merged in
+> image-rs/image-webp#161, #164 and #172) — it simply has not been cut into a
+> release. This fork tracks that branch so EmgR can depend on a stable git
+> revision instead of pinning an upstream SHA directly.
+>
+> **Divergence from upstream is kept deliberately minimal** — currently the package
+> rename, a corrected `WebPEncoder::new` doc comment, and this note. The Rust lib
+> target is still named `image_webp`, so downstream code reads
+> `use image_webp::...` unchanged. Everything else is upstream's work under
+> upstream's MIT/Apache-2.0 licensing.
+>
+> **This fork is temporary.** When upstream releases lossy encoding to crates.io,
+> EmgR should switch back to the upstream crate and this fork should be archived.
+
 # image-webp
 
 [![crates.io](https://img.shields.io/crates/v/image-webp.svg)](https://crates.io/crates/image-webp)

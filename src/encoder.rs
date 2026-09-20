@@ -137,7 +137,10 @@ pub struct WebPEncoder<W> {
 impl<W: Write> WebPEncoder<W> {
     /// Create a new encoder that writes its output to `w`.
     ///
-    /// Only supports "VP8L" lossless encoding.
+    /// Defaults to "VP8L" lossless encoding. Set
+    /// [`EncoderParams::use_lossy`] (with [`EncoderParams::lossy_quality`])
+    /// via [`WebPEncoder::set_params`] to emit a lossy "VP8 " bitstream
+    /// instead.
     pub fn new(w: W) -> Self {
         Self {
             writer: w,
