@@ -96,8 +96,24 @@ impl ArithmeticEncoder {
         if let Some(value) = value {
             let abs_value = value.unsigned_abs();
             self.write_literal(num_bits, abs_value);
-            let sign = value >= 0;
-            self.write_flag(sign);
+            // Sign convention: the flag is `true` when the value is
+            // *negative* - matching both the spec (9.6/9.3: "sign bit, 1 =
+            // negative") and `ArithmeticDecoder::cold_read_optional_signed_value`
+            // / `FastDecoder::read_optional_signed_value`, which both compute
+            // `if sign { -magnitude } else { magnitude }`. It also matches
+            // this crate's own DCT-coefficient sign convention a few call
+            // sites away (`encoder.write_flag(!event.quantized_value.is_positive())`,
+            // "flag means coeff is negative").
+            //
+            // This used to be `write_flag(value >= 0)` - backwards relative
+            // to the decoder above - which silently round-tripped a wrong
+            // sign for any *signed, non-zero* optional value. It was never
+            // caught because every caller until VP8 segmentation
+            // (`Vp8Encoder::encode_segment_updates`) only ever passed `None`
+            // for these fields, so the buggy branch was dead code: flipping
+            // the bit written for a value that never got written doesn't
+            // change any prior test's bytes.
+            self.write_flag(value < 0);
         }
     }
 

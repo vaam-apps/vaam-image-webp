@@ -53,8 +53,12 @@ struct MacroblockInfo {
     // work with that as well
     luma_bpred: Option<[IntraMode; 16]>,
     chroma_mode: ChromaMode,
-    // whether the macroblock uses custom segment values
-    // if None, will use the frame level values
+    // Which of `Vp8Encoder::segments` this macroblock uses (index into
+    // `segments`, 0..MAX_SEGMENTS), chosen by `classify_segments`'s activity
+    // classifier and set by `choose_macroblock_info` - the only place this
+    // is ever `None` is `MacroblockInfo::default()` before that runs.
+    // `unwrap_or(0)` elsewhere is a defensive fallback, not a real "no
+    // segment" case: segmentation is always on (see `setup_encoding`).
     segment_id: Option<usize>,
 
     coeffs_skipped: bool,
@@ -175,7 +179,11 @@ fn tree_bit_cost(tree: &[i8], probabilities: &[Prob], value: i8) -> f64 {
 
 fn branch_bit_cost(prob: Prob, branch_is_true: bool) -> f64 {
     let p_false = f64::from(prob) / 256.0;
-    let p = if branch_is_true { 1.0 - p_false } else { p_false };
+    let p = if branch_is_true {
+        1.0 - p_false
+    } else {
+        p_false
+    };
     // `prob` is a u8 in 0..=255 so `p` never reaches exactly 0 or 1, but
     // guard the log anyway rather than relying on that.
     -p.clamp(f64::MIN_POSITIVE, 1.0).log2()
@@ -211,9 +219,11 @@ const LAMBDA_SCALE: f64 = 0.02;
 ///
 /// We use the macroblock's luma AC quantizer step (`segment.yac`) as
 /// `Qstep`, since AC coefficients dominate both the coefficient count and
-/// the typical energy in a block, and this crate does not yet do
-/// per-macroblock quantizer search (segments are unused beyond segment 0),
-/// so it is the one step size that is actually representative here.
+/// the typical energy in a block. `segment` here is always the specific
+/// segment `classify_segments` assigned this macroblock to (see
+/// `choose_macroblock_info`), not a frame-wide constant: adaptive
+/// quantisation means different macroblocks can have different `Qstep`, so
+/// `lambda` has to be recomputed per macroblock rather than once per frame.
 ///
 /// The classical bit-domain constant (`c ~= 0.85`) assumes rate is measured
 /// in real bits; our `coeff_rate_estimate` proxy is in "coefficient units"
@@ -407,8 +417,7 @@ type TokenCounts = [[[[[u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
 /// (`tree_encode_path`) and counting each branch instead of encoding it.
 fn accumulate_token_events(counts: &mut TokenCounts, plane: Plane, events: &[TokenEvent]) {
     for event in events {
-        for (bit, prob_index) in tree_encode_path(&DCT_TOKEN_TREE, event.token, event.start_index)
-        {
+        for (bit, prob_index) in tree_encode_path(&DCT_TOKEN_TREE, event.token, event.start_index) {
             counts[plane as usize][event.band][event.context][prob_index][usize::from(bit)] += 1;
         }
     }
@@ -438,7 +447,8 @@ const MIN_TOKEN_PROB_OBSERVATIONS: u64 = 20;
 /// uses of `branch_bit_cost(prob, true)`, added up instead of walked one
 /// branch at a time.
 fn total_branch_bit_cost(false_count: u64, true_count: u64, prob: Prob) -> f64 {
-    false_count as f64 * branch_bit_cost(prob, false) + true_count as f64 * branch_bit_cost(prob, true)
+    false_count as f64 * branch_bit_cost(prob, false)
+        + true_count as f64 * branch_bit_cost(prob, true)
 }
 
 /// Decides, from `counts` (see `Vp8Encoder::collect_token_counts`), which of
@@ -519,6 +529,118 @@ fn derive_updated_token_probs(counts: &TokenCounts) -> TokenProbTables {
     probs
 }
 
+// --- Segmentation (adaptive quantisation) -----------------------------------
+//
+// VP8 keyframes can split their macroblocks across up to `MAX_SEGMENTS`
+// segments (9.3), each with its own quantiser (and loop-filter level, unused
+// here - see `setup_encoding`'s doc comment on `filter_level` for why the
+// loop filter is off entirely). This is how an encoder spends fewer bits on
+// busy, texture-masked macroblocks and more on smooth ones, where banding
+// and blocking are visible: `classify_segments` decides which macroblock
+// gets which segment, `SEGMENT_QUANT_DELTAS` decides what each segment's
+// quantiser actually is, and `build_segment` derives the quantiser values
+// from that the same way the decoder will.
+
+fn dc_quant(index: i32) -> i16 {
+    DC_QUANT[index.clamp(0, 127) as usize]
+}
+
+fn ac_quant(index: i32) -> i16 {
+    AC_QUANT[index.clamp(0, 127) as usize]
+}
+
+/// Per-segment quantiser-index delta, added to the frame's base quantiser
+/// index (`yac_abs`) to get that segment's actual index - see `build_segment`.
+/// Ordered by `classify_segments`'s quartile rank: index 0 is the
+/// lowest-activity quartile (the flattest macroblocks), `MAX_SEGMENTS - 1`
+/// the busiest.
+///
+/// Flat regions are exactly where banding and blocking are visible, so they
+/// get a negative delta (finer quantiser, more bits spent); busy/textured
+/// regions mask quantisation error, so they get a positive delta (coarser
+/// quantiser, fewer bits) - the same masking argument libvpx's and x264's
+/// adaptive quantisation are built on. Keeping the two inner quartiles close
+/// to 0 keeps the frame's *average* quantiser close to what `yac_abs` alone
+/// would have given, which is what keeps `lossy_quality` monotonic with
+/// segmentation on (see `encode_segment_updates`'s delta-mode doc comment).
+/// Magnitudes were picked by sweeping `examples/ssimu2_eval.rs` (SSIMULACRA2
+/// at fixed quality - the metric that actually decides whether a perceptual
+/// reallocation like this helped, see that example's doc comment) and
+/// `examples/rd_eval.rs` against the Kodak corpus; see the commit message
+/// for the resulting numbers.
+const SEGMENT_QUANT_DELTAS: [i8; MAX_SEGMENTS] = [-6, -2, 2, 7];
+
+/// Builds one segment's dequantised-domain quantiser values from this
+/// frame's base quantiser index and a per-segment delta, replicating
+/// `Vp8Decoder::read_quantization_indices`'s formula in `lossy/mod.rs`
+/// field for field - same clamps (`ac_quant`/`dc_quant`'s `0..=127` index
+/// clamp, `y2ac`'s floor of 8, `uvdc`'s ceiling of 132) and all. This is
+/// what makes segmentation consistent end to end: the decoder derives a
+/// segment's quantiser purely from the header bytes `encode_segment_updates`
+/// writes (`quantizer_level` below is exactly the `delta` that goes into
+/// that header), so if this function's formula ever drifted from the
+/// decoder's, the bitstream would still decode - just to the wrong pixels,
+/// silently. `indices` supplies the frame-level per-plane deltas
+/// (`ydc_delta` etc.), which apply identically to every segment and are
+/// currently always `None`/0 - segmentation only varies `base`.
+fn build_segment(yac_abs: u8, delta: i8, indices: &QuantizationIndices) -> Segment {
+    let base = i32::from(yac_abs) + i32::from(delta);
+
+    let ydc_delta = indices.ydc_delta.map_or(0, i32::from);
+    let y2dc_delta = indices.y2dc_delta.map_or(0, i32::from);
+    let y2ac_delta = indices.y2ac_delta.map_or(0, i32::from);
+    let uvdc_delta = indices.uvdc_delta.map_or(0, i32::from);
+    let uvac_delta = indices.uvac_delta.map_or(0, i32::from);
+
+    let y2ac = ((i32::from(ac_quant(base + y2ac_delta)) * 155 / 100) as i16).max(8);
+    let uvdc = dc_quant(base + uvdc_delta).min(132);
+
+    Segment {
+        ydc: dc_quant(base + ydc_delta),
+        yac: ac_quant(base),
+        y2dc: dc_quant(base + y2dc_delta) * 2,
+        y2ac,
+        uvdc,
+        uvac: ac_quant(base + uvac_delta),
+        delta_values: true,
+        quantizer_level: delta,
+        loopfilter_level: 0,
+    }
+}
+
+/// Probabilities for `SEGMENT_ID_TREE` (9.3/19.2), derived from the real
+/// distribution of `segment_ids` instead of the spec's 255-per-node ("almost
+/// always branch false") default, which assumes segmentation is barely used
+/// - the opposite of this encoder, which always segments every macroblock.
+///
+/// `classify_segments`'s quartile split already makes each of the tree's
+/// three nodes close to a 50/50 branch by construction (each segment gets
+/// about `n / 4` macroblocks), so this mostly corrects for `n` not dividing
+/// evenly by 4 - but computing the exact value is one pass over `segment_ids`
+/// plus three lookups, so there is no reason to settle for the approximation
+/// when the real value is this cheap.
+fn segment_tree_probs_for(segment_ids: &[u8]) -> [Prob; 3] {
+    let mut counts = [0u32; MAX_SEGMENTS];
+    for &id in segment_ids {
+        counts[id as usize] += 1;
+    }
+    let total = segment_ids.len() as u32;
+
+    // `SEGMENT_ID_TREE = [2, 4, -0, -1, -2, -3]`: node 0 (the root) branches
+    // false to node 1 (values {0, 1}) and true to node 2 (values {2, 3});
+    // node 1 branches false/true to 0/1, node 2 false/true to 2/3.
+    //
+    // `skip_probability(true_count, total)` computes "probability that a
+    // boolean flag is false", scaled to a byte, from a count of how often
+    // it's true - exactly what each node above needs, just generalised past
+    // its original `coeffs_skipped` use.
+    let high_half = counts[2] + counts[3];
+    let prob0 = skip_probability(high_half, total);
+    let prob1 = skip_probability(counts[1], counts[0] + counts[1]);
+    let prob2 = skip_probability(counts[3], counts[2] + counts[3]);
+    [prob0, prob1, prob2]
+}
+
 struct Vp8Encoder<W> {
     writer: W,
     frame: Frame,
@@ -526,6 +648,21 @@ struct Vp8Encoder<W> {
     encoder: ArithmeticEncoder,
     segments: [Segment; MAX_SEGMENTS],
     segments_enabled: bool,
+    /// Probabilities for `SEGMENT_ID_TREE` (9.3/19.2), derived from the
+    /// actual distribution of `mb_segment_ids` by `segment_tree_probs_for`
+    /// once per frame - see that function's doc comment for why the
+    /// quartile classifier makes the default 128/128/128 already close to
+    /// optimal, and why we compute the real value anyway.
+    segment_tree_probs: [Prob; 3],
+    /// Which of `segments` each macroblock uses, indexed `mby *
+    /// macroblock_width + mbx`. Populated once per frame by
+    /// `classify_segments` (called from `setup_encoding`, after
+    /// `self.frame`/`macroblock_width`/`macroblock_height` are set) and read
+    /// by `choose_macroblock_info`, which is the only place a `segment_id`
+    /// is chosen for a macroblock - everywhere else threads the id that
+    /// decision already made, so mode decision, quantisation and
+    /// reconstruction always agree on which segment a macroblock is in.
+    mb_segment_ids: Vec<u8>,
 
     loop_filter_adjustments: bool,
     macroblock_no_skip_coeff: Option<u8>,
@@ -566,6 +703,8 @@ impl<W: Write> Vp8Encoder<W> {
             encoder: ArithmeticEncoder::new(),
             segments: [segment; MAX_SEGMENTS],
             segments_enabled: false,
+            segment_tree_probs: [128; 3],
+            mb_segment_ids: Vec::new(),
 
             loop_filter_adjustments: false,
             macroblock_no_skip_coeff: None,
@@ -680,9 +819,48 @@ impl<W: Write> Vp8Encoder<W> {
         Ok(())
     }
 
+    /// Writes `update_segmentation()` (9.3) for this frame. Every keyframe
+    /// this encoder produces stands alone (there is no previous frame's
+    /// segment map to reuse, and `Vp8Decoder` only ever decodes keyframes -
+    /// see its doc comment), so both `update_mb_segmentation_map` and
+    /// `update_segment_feature_data` are unconditionally `true`: this
+    /// frame's map and quantiser deltas are always transmitted fresh.
     fn encode_segment_updates(&mut self) {
-        // TODO: encode this as per 9.3
-        todo!();
+        self.encoder.write_flag(true); // update_mb_segmentation_map
+        self.encoder.write_flag(true); // update_segment_feature_data
+
+        // segment_feature_mode: `false` selects "delta" values, added to
+        // the frame's own `yac_abs` (`encode_quantization_indices`) rather
+        // than replacing it outright (`true`, "absolute"). Delta mode is
+        // what keeps a segment's quantiser centred on the quality the
+        // caller actually asked for - `classify_segments`'s deltas widen or
+        // narrow it per segment, they never override it - so `lossy_quality`
+        // keeps behaving monotonically with segmentation on, matching how
+        // it behaved with segmentation off.
+        self.encoder.write_flag(false);
+
+        for segment in &self.segments {
+            self.encoder
+                .write_optional_signed_value(7, Some(segment.quantizer_level));
+        }
+        for _ in 0..MAX_SEGMENTS {
+            // Loop filter deltas: the frame-level filter is unconditionally
+            // disabled (`frame.filter_level == 0`, see `setup_encoding`'s
+            // doc comment on why), so no segment ever needs its own
+            // loop-filter adjustment - `None` here costs one flag bit and
+            // leaves `Segment::loopfilter_level` at its default of 0.
+            self.encoder.write_optional_signed_value(6, None);
+        }
+
+        for &prob in &self.segment_tree_probs {
+            // Always signal an explicit probability rather than falling
+            // back to the spec's 255 default (9.3): `segment_tree_probs_for`
+            // already computed the value that best matches this frame's
+            // actual segment distribution, and the update itself only costs
+            // 9 bits (1 flag + 8 value) per node.
+            self.encoder.write_flag(true);
+            self.encoder.write_literal(8, prob);
+        }
     }
 
     fn encode_loop_filter_adjustments(&mut self) {
@@ -736,10 +914,19 @@ impl<W: Write> Vp8Encoder<W> {
 
     fn write_macroblock_header(&mut self, macroblock_info: &MacroblockInfo, mbx: usize) {
         if self.segments_enabled {
-            if let Some(_segment_id) = macroblock_info.segment_id {
-                // TODO: set segment for macroblock
-                todo!();
-            }
+            // `encode_segment_updates` always sets `update_mb_segmentation_map`,
+            // so every macroblock's id is transmitted here (11.1) - every
+            // `MacroblockInfo` this encoder produces has one, since
+            // `choose_macroblock_info` is the only place `segment_id` is set
+            // and it always sets it from `mb_segment_ids`.
+            let segment_id = macroblock_info
+                .segment_id
+                .expect("segments_enabled implies every macroblock has a segment_id");
+            self.encoder.write_with_tree(
+                &SEGMENT_ID_TREE,
+                &self.segment_tree_probs,
+                segment_id as i8,
+            );
         }
 
         if let Some(prob) = self.macroblock_no_skip_coeff {
@@ -1070,11 +1257,8 @@ impl<W: Write> Vp8Encoder<W> {
                 let y_block_data =
                     self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info);
 
-                let (u_block_data, v_block_data) = self.transform_chroma_blocks(
-                    mbx.into(),
-                    mby.into(),
-                    macroblock_info.chroma_mode,
-                );
+                let (u_block_data, v_block_data) =
+                    self.transform_chroma_blocks(mbx.into(), mby.into(), &macroblock_info);
 
                 if !macroblock_info.coeffs_skipped {
                     self.encode_residual_data(
@@ -1153,7 +1337,13 @@ impl<W: Write> Vp8Encoder<W> {
     /// returns - so the borders the *next* macroblock predicts from are
     /// always the actual reconstruction of the chosen mode, never a trial.
     fn choose_macroblock_info(&self, mbx: usize, mby: usize) -> MacroblockInfo {
-        let segment = self.segments[0];
+        // The one place a macroblock's segment id is decided - every other
+        // reader of `MacroblockInfo::segment_id` (quantisation, residual
+        // coding, reconstruction) just threads this same value through, so
+        // they all agree on which segment - and therefore which quantiser -
+        // this macroblock uses.
+        let segment_id = self.mb_segment_ids[mby * usize::from(self.macroblock_width) + mbx];
+        let segment = self.segments[segment_id as usize];
         let lambda = mode_decision_lambda(&segment);
 
         let mut best_luma: Option<(f64, LumaMode, Luma16x16Coeffs)> = None;
@@ -1201,7 +1391,8 @@ impl<W: Write> Vp8Encoder<W> {
 
         let mut best_chroma: Option<(f64, ChromaMode, ChromaCoeffs, ChromaCoeffs)> = None;
         for &mode in &Self::CHROMA_MODE_CANDIDATES {
-            let (distortion, rate, u_coeffs, v_coeffs) = self.trial_chroma(mode, mbx, mby);
+            let (distortion, rate, u_coeffs, v_coeffs) =
+                self.trial_chroma(mode, mbx, mby, &segment);
             let cost = distortion as f64 + lambda * rate as f64;
             let better = match &best_chroma {
                 None => true,
@@ -1228,7 +1419,7 @@ impl<W: Write> Vp8Encoder<W> {
             luma_mode,
             luma_bpred,
             chroma_mode,
-            segment_id: None,
+            segment_id: Some(segment_id as usize),
             coeffs_skipped,
         }
     }
@@ -1248,7 +1439,8 @@ impl<W: Write> Vp8Encoder<W> {
         let y_with_border = self.get_predicted_luma_block_16x16(luma_mode, mbx, mby);
         let luma_blocks = self.get_luma_blocks_from_predicted_16x16(&y_with_border, mbx, mby);
         let mut coeffs = self.get_luma_block_coeffs_16x16(luma_blocks, segment);
-        let dequantized_blocks = self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs);
+        let dequantized_blocks =
+            self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs, segment);
 
         // Reconstruct into a copy of the predicted block so this trial never
         // touches `self.top_border_y` / `self.left_border_y`.
@@ -1377,8 +1569,15 @@ impl<W: Write> Vp8Encoder<W> {
                 // predicted 4x4 block, the dequantized residual) of the
                 // best candidate seen so far for this sub-block.
                 #[allow(clippy::type_complexity)]
-                let mut best: Option<(f64, IntraMode, i64, f64, [i32; 16], [u8; 16], [i32; 16])> =
-                    None;
+                let mut best: Option<(
+                    f64,
+                    IntraMode,
+                    i64,
+                    f64,
+                    [i32; 16],
+                    [u8; 16],
+                    [i32; 16],
+                )> = None;
 
                 for &mode in &Self::BPRED_MODE_CANDIDATES {
                     // Every 4x4 predictor reads only border pixels that are
@@ -1407,8 +1606,7 @@ impl<W: Write> Vp8Encoder<W> {
                         for x in 0..4 {
                             let border_index = (y0 + y) * stride + x0 + x;
                             let predicted_value = y_with_border[border_index];
-                            let actual_value =
-                                self.frame.ybuf[y_data_block_index + y * width + x];
+                            let actual_value = self.frame.ybuf[y_data_block_index + y * width + x];
                             predicted_block[y * 4 + x] = predicted_value;
                             residual[y * 4 + x] =
                                 i32::from(actual_value) - i32::from(predicted_value);
@@ -1441,9 +1639,8 @@ impl<W: Write> Vp8Encoder<W> {
                         for x in 0..4 {
                             let p = i32::from(predicted_block[y * 4 + x]);
                             let r = (p + dequantized[y * 4 + x]).clamp(0, 255);
-                            let actual = i64::from(
-                                self.frame.ybuf[y_data_block_index + y * width + x],
-                            );
+                            let actual =
+                                i64::from(self.frame.ybuf[y_data_block_index + y * width + x]);
                             let d = i64::from(r) - actual;
                             distortion += d * d;
                         }
@@ -1510,6 +1707,7 @@ impl<W: Write> Vp8Encoder<W> {
         chroma_mode: ChromaMode,
         mbx: usize,
         mby: usize,
+        segment: &Segment,
     ) -> (i64, i64, ChromaCoeffs, ChromaCoeffs) {
         let mut predicted_u = self.get_predicted_chroma_block(
             chroma_mode,
@@ -1531,11 +1729,11 @@ impl<W: Write> Vp8Encoder<W> {
         let v_blocks =
             self.get_chroma_blocks_from_predicted(&predicted_v, &self.frame.vbuf, mbx, mby);
 
-        let u_coeffs = self.get_chroma_block_coeffs(u_blocks);
-        let v_coeffs = self.get_chroma_block_coeffs(v_blocks);
+        let u_coeffs = self.get_chroma_block_coeffs(u_blocks, segment);
+        let v_coeffs = self.get_chroma_block_coeffs(v_blocks, segment);
 
-        let dequantized_u = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs);
-        let dequantized_v = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs);
+        let dequantized_u = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs, segment);
+        let dequantized_v = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs, segment);
 
         for y in 0usize..2 {
             for x in 0usize..2 {
@@ -1558,7 +1756,13 @@ impl<W: Write> Vp8Encoder<W> {
     /// Sum of squared error between a trial reconstruction of one 8x8 chroma
     /// plane (still carrying its 1-pixel border) and the true source pixels
     /// of that plane (`self.frame.ubuf` or `self.frame.vbuf`).
-    fn chroma_sse(&self, recon: &[u8; CHROMA_BLOCK_SIZE], plane: &[u8], mbx: usize, mby: usize) -> i64 {
+    fn chroma_sse(
+        &self,
+        recon: &[u8; CHROMA_BLOCK_SIZE],
+        plane: &[u8],
+        mbx: usize,
+        mby: usize,
+    ) -> i64 {
         let stride = CHROMA_STRIDE;
         let chroma_width = usize::from(self.macroblock_width) * 8;
         let mut sse: i64 = 0;
@@ -1601,7 +1805,7 @@ impl<W: Write> Vp8Encoder<W> {
             for mbx in 0..self.macroblock_width {
                 let info = self.choose_macroblock_info(mbx.into(), mby.into());
                 self.transform_luma_block(mbx.into(), mby.into(), &info);
-                self.transform_chroma_blocks(mbx.into(), mby.into(), info.chroma_mode);
+                self.transform_chroma_blocks(mbx.into(), mby.into(), &info);
 
                 total += 1;
                 if info.coeffs_skipped {
@@ -1646,8 +1850,7 @@ impl<W: Write> Vp8Encoder<W> {
                 let info = self.choose_macroblock_info(mbx, mby);
 
                 let y_block_data = self.transform_luma_block(mbx, mby, &info);
-                let (u_block_data, v_block_data) =
-                    self.transform_chroma_blocks(mbx, mby, info.chroma_mode);
+                let (u_block_data, v_block_data) = self.transform_chroma_blocks(mbx, mby, &info);
 
                 if info.coeffs_skipped {
                     // matches `encode_image`'s handling of a skipped
@@ -1780,6 +1983,71 @@ impl<W: Write> Vp8Encoder<W> {
         }
     }
 
+    /// Population variance of one macroblock's source luma (16x16 = 256
+    /// samples) - the standard, cheap proxy for local activity used by
+    /// `classify_segments` to decide how much quantisation error a
+    /// macroblock can absorb before it becomes visible. Reads
+    /// `self.frame.ybuf` directly (source pixels, not any prediction), so it
+    /// is available as soon as `self.frame` is set, independent of mode
+    /// decision order.
+    fn macroblock_luma_variance(&self, mbx: usize, mby: usize) -> f64 {
+        let width = usize::from(self.macroblock_width) * 16;
+        let mut sum: i64 = 0;
+        let mut sum_sq: i64 = 0;
+        for y in 0..16 {
+            let row_start = (mby * 16 + y) * width + mbx * 16;
+            for x in 0..16 {
+                let v = i64::from(self.frame.ybuf[row_start + x]);
+                sum += v;
+                sum_sq += v * v;
+            }
+        }
+        const N: f64 = 256.0;
+        let mean = sum as f64 / N;
+        let mean_sq = sum_sq as f64 / N;
+        // Rounding can push this fractionally below 0 for a perfectly flat
+        // block; clamp rather than let a negative "variance" through.
+        (mean_sq - mean * mean).max(0.0)
+    }
+
+    /// Assigns every macroblock to one of `MAX_SEGMENTS` segments by the
+    /// quartile of its source-luma variance (`macroblock_luma_variance`)
+    /// among this frame's macroblocks: segment 0 is the flattest quarter,
+    /// `MAX_SEGMENTS - 1` the busiest. Returns the per-macroblock segment
+    /// id, indexed `mby * macroblock_width + mbx` (the same indexing
+    /// `mb_segment_ids` is stored and read with).
+    ///
+    /// Quartiles over k-means: k-means needs an iterative fit to converge on
+    /// centroids, and even then can land an uneven number of macroblocks per
+    /// cluster depending on the frame's variance distribution. A single sort
+    /// gives an exactly-even split by construction, in one pass,
+    /// deterministically - and since `MAX_SEGMENTS` is fixed at 4 by the
+    /// bitstream format (9.3) rather than chosen per frame, there is no
+    /// "natural cluster count" here for k-means to discover that a fixed
+    /// quartile split doesn't already give just as well. An even split also
+    /// has a convenient side effect `segment_tree_probs_for` relies on: it
+    /// keeps each segment-id tree node close to a 50/50 branch regardless of
+    /// the image's actual variance distribution.
+    fn classify_segments(&self) -> Vec<u8> {
+        let mb_w = usize::from(self.macroblock_width);
+        let mb_h = usize::from(self.macroblock_height);
+        let n = mb_w * mb_h;
+
+        let variances: Vec<f64> = (0..n)
+            .map(|i| self.macroblock_luma_variance(i % mb_w, i / mb_w))
+            .collect();
+
+        let mut by_variance: Vec<usize> = (0..n).collect();
+        by_variance.sort_by(|&a, &b| variances[a].total_cmp(&variances[b]));
+
+        let mut segment_ids = vec![0u8; n];
+        for (rank, &mb_index) in by_variance.iter().enumerate() {
+            let quartile = rank * MAX_SEGMENTS / n.max(1);
+            segment_ids[mb_index] = quartile.min(MAX_SEGMENTS - 1) as u8;
+        }
+        segment_ids
+    }
+
     // sets up the encoding of the encoder by setting all the encoder params based on the width and height
     fn setup_encoding(
         &mut self,
@@ -1853,25 +2121,30 @@ impl<W: Write> Vp8Encoder<W> {
         }
 
         let quant_index: u8 = (127 - u16::from(lossy_quality) * 127 / 100) as u8;
-        let quant_index_usize: usize = quant_index as usize;
 
-        self.segments_enabled = false;
-        let quantization_indices = QuantizationIndices {
+        self.quantization_indices = QuantizationIndices {
             yac_abs: quant_index,
             ..Default::default()
         };
-        self.quantization_indices = quantization_indices;
 
-        let segment = Segment {
-            ydc: DC_QUANT[quant_index_usize],
-            yac: AC_QUANT[quant_index_usize],
-            y2dc: DC_QUANT[quant_index_usize] * 2,
-            y2ac: ((i32::from(AC_QUANT[quant_index_usize]) * 155 / 100) as i16).max(8),
-            uvdc: DC_QUANT[quant_index_usize],
-            uvac: AC_QUANT[quant_index_usize],
-            ..Default::default()
-        };
-        self.segments[0] = segment;
+        // Adaptive quantisation (VP8 segmentation, 9.3): classify every
+        // macroblock by source-luma activity, then give each of the 4
+        // resulting segments its own quantiser via `SEGMENT_QUANT_DELTAS`.
+        // `self.frame` (source pixels) and `macroblock_width`/`_height` are
+        // already set above, which is everything `classify_segments` needs.
+        //
+        // This is unconditional - every frame this encoder produces is
+        // segmented - rather than gated behind a flag: it is strictly more
+        // expressive than the single-quantiser path it replaces (all 4
+        // segments collapse to the same quantiser if `SEGMENT_QUANT_DELTAS`
+        // were all 0), and there is no reason a caller would want the coarser
+        // behaviour on purpose.
+        self.segments_enabled = true;
+        self.mb_segment_ids = self.classify_segments();
+        for (segment, &delta) in self.segments.iter_mut().zip(SEGMENT_QUANT_DELTAS.iter()) {
+            *segment = build_segment(quant_index, delta, &self.quantization_indices);
+        }
+        self.segment_tree_probs = segment_tree_probs_for(&self.mb_segment_ids);
 
         self.reset_frame_state();
     }
@@ -2008,9 +2281,9 @@ impl<W: Write> Vp8Encoder<W> {
     fn get_dequantized_blocks_from_coeffs_luma_16x16(
         &self,
         coeffs: &mut Luma16x16Coeffs,
+        segment: &Segment,
     ) -> [i32; 16 * 16] {
         let mut dequantized_luma_residue = [0i32; 16 * 16];
-        let segment = self.segments[0];
 
         for (k, y2_coeff) in coeffs.y2_coeffs.iter_mut().enumerate() {
             let quant = if k > 0 { segment.y2ac } else { segment.y2dc };
@@ -2041,15 +2314,29 @@ impl<W: Write> Vp8Encoder<W> {
     // 4. Quantizes the block and dequantizes each subblock
     // 5. Calculates the quantized block - this can be used to calculate how accurate the
     // result is and is used to populate the borders for the next macroblock
+    //
+    // Segment consistency: this always looks up `self.segments[macroblock_info
+    // .segment_id]` - the same id `choose_macroblock_info` picked for this
+    // macroblock via `classify_segments` - rather than any fixed segment.
+    // `choose_macroblock_info`'s RD search already priced every mode against
+    // that same segment's quantiser (`mode_decision_lambda`,
+    // `trial_luma_16x16`/`trial_luma_bpred`), so reconstruction has to use
+    // the identical quantiser too: any mismatch here would still decode
+    // (the bitstream itself is self-consistent), but the border pixels this
+    // writes for later macroblocks to predict from would silently diverge
+    // from what a real decoder reconstructs, since the decoder always
+    // dequantizes with the segment id actually written in the header.
     fn transform_luma_block(
         &mut self,
         mbx: usize,
         mby: usize,
         macroblock_info: &MacroblockInfo,
     ) -> [i32; 16 * 16] {
+        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
+
         if macroblock_info.luma_mode == LumaMode::B {
             if let Some(bpred_modes) = macroblock_info.luma_bpred {
-                return self.transform_luma_blocks_4x4(bpred_modes, mbx, mby);
+                return self.transform_luma_blocks_4x4(bpred_modes, mbx, mby, &segment);
             } else {
                 panic!("Invalid, need bpred modes for luma mode B");
             }
@@ -2059,14 +2346,13 @@ impl<W: Write> Vp8Encoder<W> {
             self.get_predicted_luma_block_16x16(macroblock_info.luma_mode, mbx, mby);
         let luma_blocks = self.get_luma_blocks_from_predicted_16x16(&y_with_border, mbx, mby);
 
-        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
-
         // get coeffs
         let mut coeffs = self.get_luma_block_coeffs_16x16(luma_blocks, &segment);
 
         // now we're essentially applying the same functions as the decoder in order to ensure
         // that the border is the same as the one used for the decoder in the same macroblock
-        let dequantized_blocks = self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs);
+        let dequantized_blocks =
+            self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs, &segment);
 
         // re-use the y_with_border from earlier since the prediction is still valid
         // applies the same thing as the decoder so that the border will line up
@@ -2101,6 +2387,7 @@ impl<W: Write> Vp8Encoder<W> {
         bpred_modes: [IntraMode; 16],
         mbx: usize,
         mby: usize,
+        segment: &Segment,
     ) -> [i32; 16 * 16] {
         let mut luma_blocks = [0i32; 16 * 16];
         let stride = 1usize + 16 + 4;
@@ -2114,8 +2401,6 @@ impl<W: Write> Vp8Encoder<W> {
             &self.top_border_y,
             &self.left_border_y,
         );
-
-        let segment = self.segments[0];
 
         for sby in 0usize..4 {
             for sbx in 0usize..4 {
@@ -2254,9 +2539,12 @@ impl<W: Write> Vp8Encoder<W> {
         chroma_blocks
     }
 
-    fn get_chroma_block_coeffs(&self, chroma_blocks: [i32; 16 * 4]) -> ChromaCoeffs {
+    fn get_chroma_block_coeffs(
+        &self,
+        chroma_blocks: [i32; 16 * 4],
+        segment: &Segment,
+    ) -> ChromaCoeffs {
         let mut chroma_coeffs: ChromaCoeffs = [0i32; 16 * 4];
-        let segment = self.segments[0];
 
         for (block, coeff_block) in chroma_blocks
             .chunks_exact(16)
@@ -2278,9 +2566,9 @@ impl<W: Write> Vp8Encoder<W> {
     fn get_dequantized_blocks_from_coeffs_chroma(
         &self,
         chroma_coeffs: &ChromaCoeffs,
+        segment: &Segment,
     ) -> [i32; 16 * 4] {
         let mut dequantized_blocks = [0i32; 16 * 4];
-        let segment = self.segments[0];
 
         for (coeffs_block, dequant_block) in chroma_coeffs
             .chunks_exact(16)
@@ -2309,9 +2597,15 @@ impl<W: Write> Vp8Encoder<W> {
         &mut self,
         mbx: usize,
         mby: usize,
-        chroma_mode: ChromaMode,
+        macroblock_info: &MacroblockInfo,
     ) -> ([i32; 16 * 4], [i32; 16 * 4]) {
         let stride = CHROMA_STRIDE;
+        let chroma_mode = macroblock_info.chroma_mode;
+        // Same segment `choose_macroblock_info` picked for this macroblock
+        // (via `macroblock_info.segment_id`) - see `transform_luma_block`'s
+        // doc comment for why reconstruction has to agree with mode
+        // decision on this.
+        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
 
         let mut predicted_u = self.get_predicted_chroma_block(
             chroma_mode,
@@ -2333,11 +2627,13 @@ impl<W: Write> Vp8Encoder<W> {
         let v_blocks =
             self.get_chroma_blocks_from_predicted(&predicted_v, &self.frame.vbuf, mbx, mby);
 
-        let u_coeffs = self.get_chroma_block_coeffs(u_blocks);
-        let v_coeffs = self.get_chroma_block_coeffs(v_blocks);
+        let u_coeffs = self.get_chroma_block_coeffs(u_blocks, &segment);
+        let v_coeffs = self.get_chroma_block_coeffs(v_blocks, &segment);
 
-        let quantized_u_residue = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs);
-        let quantized_v_residue = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs);
+        let quantized_u_residue =
+            self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs, &segment);
+        let quantized_v_residue =
+            self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs, &segment);
 
         for y in 0usize..2 {
             for x in 0usize..2 {

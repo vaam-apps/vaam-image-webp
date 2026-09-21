@@ -30,8 +30,12 @@ quick-error = "2.0.1"
 [dev-dependencies]
 # `webp` (libwebp) and `dssim-core` back examples/rd_eval.rs, which measures
 # this crate's lossy encoder against libwebp at matched perceptual quality.
-# Dev-only: neither is linked into the library, so downstreams that depend on
-# this crate to avoid C do not get libwebp through it.
+# `ssimulacra2` backs examples/ssimu2_eval.rs, which reports bytes and
+# SSIMULACRA2 at fixed quality - see that example's doc comment for why a
+# perceptual metric, not just DSSIM, is what decides whether a change like
+# adaptive quantisation actually helped. Dev-only: none of `webp`,
+# `dssim-core` or `ssimulacra2` are linked into the library, so downstreams
+# that depend on this crate to avoid C do not get libwebp through it.
 dssim-core = "3.5"
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -39,6 +43,7 @@ paste = "1.0.14"
 png = "0.17.12"
 rand = "0.8.5"
 webp = "0.3.0"
+ssimulacra2 = "0.5"
 
 [features]
 _benchmarks = []

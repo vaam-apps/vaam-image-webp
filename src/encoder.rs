@@ -332,6 +332,62 @@ mod tests {
         assert_eq!(Some(exif), exif2);
     }
 
+    /// Exercises the VP8 lossy encoder end to end - including adaptive
+    /// quantisation (segmentation) - decoded by libwebp, the same
+    /// correctness gate `examples/rd_eval.rs` and `examples/ssimu2_eval.rs`
+    /// rely on. Nothing else in `cargo test` reaches the lossy path at all
+    /// (`EncoderParams::default()` has `use_lossy: false`), so without this
+    /// a segment/quantiser inconsistency that still produces a
+    /// self-consistent bitstream - decodable, just to the wrong pixels -
+    /// would only ever show up as an unexplained quality regression in a
+    /// harness nobody runs by default.
+    ///
+    /// The source image deliberately mixes a smooth gradient with a
+    /// checkerboard so macroblocks land across more than one activity
+    /// quartile, which is what actually exercises `classify_segments`
+    /// picking more than one segment.
+    #[test]
+    fn roundtrip_libwebp_lossy_segmented() {
+        let (w, h): (u32, u32) = (200, 150);
+        let mut img = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                let (r, g, b) = if x < w / 2 {
+                    // Smooth gradient: low local activity.
+                    let v = ((x * 255) / w.max(1)) as u8;
+                    (v, v.wrapping_add((y % 255) as u8), 128)
+                } else {
+                    // Checkerboard: high local activity.
+                    let v = if (x / 4 + y / 4) % 2 == 0 { 20 } else { 235 };
+                    (v, v, v)
+                };
+                img[i] = r;
+                img[i + 1] = g;
+                img[i + 2] = b;
+            }
+        }
+
+        for lossy_quality in [1u8, 40, 75, 95, 100] {
+            let mut output = Vec::new();
+            let mut encoder = WebPEncoder::new(&mut output);
+            encoder.set_params(EncoderParams {
+                use_lossy: true,
+                lossy_quality,
+                ..Default::default()
+            });
+            encoder
+                .encode(&img, w, h, crate::ColorType::Rgb8)
+                .unwrap_or_else(|e| panic!("encode failed at lossy_quality={lossy_quality}: {e}"));
+
+            let decoded = webp::Decoder::new(&output).decode().unwrap_or_else(|| {
+                panic!("libwebp failed to decode our bitstream at lossy_quality={lossy_quality}")
+            });
+            assert_eq!(decoded.width(), w);
+            assert_eq!(decoded.height(), h);
+        }
+    }
+
     #[test]
     fn roundtrip_libwebp() {
         roundtrip_libwebp_params(EncoderParams::default());
