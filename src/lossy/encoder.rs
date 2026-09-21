@@ -101,6 +101,96 @@ fn coeff_rate_estimate(coeffs: &[i32]) -> i64 {
         .sum()
 }
 
+/// Real entropy cost, in bits, of encoding `value` with a tree-structured
+/// binary code and per-node probabilities - the same tree walk
+/// `ArithmeticEncoder::write_with_tree` (`write_with_tree_start_index` with
+/// `start_index = 0`) performs when it actually writes the symbol, except
+/// this computes `-log2(P(branch))` at each node instead of emitting a bit.
+///
+/// `probabilities[i]` is, per VP8 convention (9.2), the probability (scaled
+/// to 0..=255) that the branch at node `i` is *false*; a `false` branch
+/// therefore costs `-log2(prob / 256)` and a `true` branch costs
+/// `-log2(1 - prob / 256)`.
+///
+/// This is only used for B_PRED submode rate (see `bpred_mode_bit_cost`
+/// below), not for coefficients: `coeff_rate_estimate` is deliberately a
+/// cheap magnitude-based proxy because it runs per coefficient, per
+/// candidate mode, per macroblock, and getting the exact token-tree cost
+/// right matters less than getting *an* ordering right. The B_PRED submode
+/// tree is walked at most 10 times per sub-block (one per candidate), and
+/// its context tables (`KEYFRAME_BPRED_MODE_PROBS`) swing the real cost by
+/// several bits depending on the neighbouring submodes - which is exactly
+/// the signal the sub-block search needs in order to prefer, e.g., a
+/// slightly-worse-predicting mode that matches its neighbours' mode over a
+/// slightly-better one that doesn't. So this pays for the exact
+/// probability-weighted cost instead of reusing the coefficient proxy.
+///
+/// Note this makes `trial_luma_bpred`'s `rate` a mix of two different
+/// scales - `coeff_rate_estimate`'s inflated magnitude proxy plus this
+/// function's real Shannon bits - added together and then multiplied by
+/// the same `lambda` (which `LAMBDA_SCALE` calibrates against the proxy's
+/// scale, not bits). This is a known approximation; see
+/// `trial_luma_bpred`'s doc comment.
+fn tree_bit_cost(tree: &[i8], probabilities: &[Prob], value: i8) -> f64 {
+    let mut current_index = tree
+        .iter()
+        .position(|&x| x == -value)
+        .expect("value must be a leaf of this tree");
+
+    let mut bits = 0.0f64;
+    loop {
+        // Root children live at indices 0 (false) and 1 (true); reaching
+        // either means we've walked all the way back and the branch taken
+        // to get from that child to `value`'s leaf is not needed anymore
+        // - this mirrors `write_with_tree_start_index`'s two `if
+        // current_index == start_index (+1)` base cases with
+        // `start_index = 0`.
+        if current_index == 0 {
+            bits += branch_bit_cost(probabilities[0], false);
+            break;
+        }
+        if current_index == 1 {
+            bits += branch_bit_cost(probabilities[0], true);
+            break;
+        }
+
+        // Even index => `current_index` is some node's `false` child;
+        // odd => it's that node's `true` child, at `current_index - 1`.
+        let (branch_is_true, node_index) = if current_index % 2 == 0 {
+            (false, current_index)
+        } else {
+            (true, current_index - 1)
+        };
+        bits += branch_bit_cost(probabilities[node_index / 2], branch_is_true);
+
+        // Find the parent: the node whose child pointer equals this node's
+        // own index.
+        current_index = tree
+            .iter()
+            .position(|&x| x == node_index as i8)
+            .expect("every non-root tree node is some other node's child");
+    }
+    bits
+}
+
+fn branch_bit_cost(prob: Prob, branch_is_true: bool) -> f64 {
+    let p_false = f64::from(prob) / 256.0;
+    let p = if branch_is_true { 1.0 - p_false } else { p_false };
+    // `prob` is a u8 in 0..=255 so `p` never reaches exactly 0 or 1, but
+    // guard the log anyway rather than relying on that.
+    -p.clamp(f64::MIN_POSITIVE, 1.0).log2()
+}
+
+/// Rate, in bits, of signalling one B_PRED sub-block's `IntraMode` given
+/// its above (`top`) and left (`left`) neighbouring submodes - the same
+/// context `write_macroblock_header` looks up in `KEYFRAME_BPRED_MODE_PROBS`
+/// when it actually writes the mode. See `tree_bit_cost` for the mechanism
+/// and `trial_luma_bpred` for how this is combined with coefficient rate.
+fn bpred_mode_bit_cost(top: IntraMode, left: IntraMode, mode: IntraMode) -> f64 {
+    let probs = &KEYFRAME_BPRED_MODE_PROBS[top as usize][left as usize];
+    tree_bit_cost(&KEYFRAME_BPRED_MODE_TREE, probs, mode as i8)
+}
+
 // Empirically tuned multiplier for `mode_decision_lambda`, see there for the
 // derivation. Calibrated against `examples/rd_eval` on the Kodak corpus.
 const LAMBDA_SCALE: f64 = 0.02;
@@ -809,15 +899,34 @@ impl<W: Write> Vp8Encoder<W> {
     }
 
     /// The four "whole macroblock" luma prediction modes considered by RD
-    /// mode decision. `LumaMode::B` (independent 4x4 sub-block prediction)
-    /// is not a candidate here: it needs its own per-block search with
-    /// `left_b_pred`/`top_b_pred` context tracking, which is a separate,
-    /// optional phase (see the module's design notes in the commit history).
+    /// mode decision. `LumaMode::B` (independent-per-sub-block prediction)
+    /// is deliberately not in this list - it needs its own per-block search
+    /// with sequential reconstruction and `left_b_pred`/`top_b_pred` context
+    /// tracking, which `trial_luma_bpred` does separately; its result is
+    /// compared against the winner of this list in `choose_macroblock_info`.
     const LUMA_MODE_CANDIDATES: [LumaMode; 4] =
         [LumaMode::DC, LumaMode::V, LumaMode::H, LumaMode::TM];
 
     const CHROMA_MODE_CANDIDATES: [ChromaMode; 4] =
         [ChromaMode::DC, ChromaMode::V, ChromaMode::H, ChromaMode::TM];
+
+    /// The ten 4x4 intra prediction modes considered for each B_PRED
+    /// sub-block by `trial_luma_bpred`. A distinct type (`IntraMode`) and a
+    /// distinct search from `LUMA_MODE_CANDIDATES` above: one `IntraMode` is
+    /// chosen per 4x4 sub-block (16 per macroblock) rather than once for the
+    /// whole macroblock.
+    const BPRED_MODE_CANDIDATES: [IntraMode; 10] = [
+        IntraMode::DC,
+        IntraMode::TM,
+        IntraMode::VE,
+        IntraMode::HE,
+        IntraMode::LD,
+        IntraMode::RD,
+        IntraMode::VR,
+        IntraMode::VL,
+        IntraMode::HD,
+        IntraMode::HU,
+    ];
 
     /// Picks the luma and chroma prediction modes for one macroblock by
     /// Lagrangian RD cost (`distortion + lambda * rate`, see
@@ -849,8 +958,36 @@ impl<W: Write> Vp8Encoder<W> {
                 best_luma = Some((cost, mode, coeffs));
             }
         }
-        let (_, luma_mode, luma_coeffs) =
+        let (best_16x16_cost, luma_mode_16x16, luma_coeffs_16x16) =
             best_luma.expect("LUMA_MODE_CANDIDATES is non-empty");
+
+        // B_PRED candidate: a sequential, per-sub-block search (see
+        // `trial_luma_bpred`'s doc comment for why it can't be scored the
+        // same way as the four whole-macroblock modes above), compared
+        // against the best of those four by the exact same Lagrangian cost
+        // so the comparison is apples to apples.
+        let (bpred_distortion, bpred_rate, bpred_modes, bpred_coeffs) =
+            self.trial_luma_bpred(mbx, mby, &segment, lambda);
+        let bpred_cost = bpred_distortion as f64 + lambda * bpred_rate;
+
+        // B_PRED has no Y2 block (`encode_residual_data` branches on this
+        // exact condition), so its "all zero" check only looks at the 16
+        // sub-blocks' own coefficients - there is no separate Y2 plane to
+        // also check, unlike the 16x16 modes just below.
+        let (luma_mode, luma_bpred, luma_all_zero) = if bpred_cost < best_16x16_cost {
+            (
+                LumaMode::B,
+                Some(bpred_modes),
+                bpred_coeffs.iter().all(|&c| c == 0),
+            )
+        } else {
+            (
+                luma_mode_16x16,
+                None,
+                luma_coeffs_16x16.y2_coeffs.iter().all(|&c| c == 0)
+                    && luma_coeffs_16x16.y_coeffs.iter().all(|&c| c == 0),
+            )
+        };
 
         let mut best_chroma: Option<(f64, ChromaMode, ChromaCoeffs, ChromaCoeffs)> = None;
         for &mode in &Self::CHROMA_MODE_CANDIDATES {
@@ -868,19 +1005,18 @@ impl<W: Write> Vp8Encoder<W> {
             best_chroma.expect("CHROMA_MODE_CANDIDATES is non-empty");
 
         // The macroblock can be signalled as skipped iff the chosen modes
-        // leave every quantized coefficient at zero - luma AC (`y_coeffs`),
-        // luma DC-of-each-block (`y2_coeffs`, since luma_mode is never B
-        // here), and both chroma planes. `write_macroblock_header` /
-        // `encode_image` are what actually act on this flag; this is purely
-        // "would every block we're about to write be empty".
-        let coeffs_skipped = luma_coeffs.y2_coeffs.iter().all(|&c| c == 0)
-            && luma_coeffs.y_coeffs.iter().all(|&c| c == 0)
-            && u_coeffs.iter().all(|&c| c == 0)
-            && v_coeffs.iter().all(|&c| c == 0);
+        // leave every quantized coefficient at zero - luma (`luma_all_zero`,
+        // computed above from either the 16x16 y2+y coefficients or the
+        // B_PRED sub-blocks' own coefficients, whichever mode won) and both
+        // chroma planes. `write_macroblock_header` / `encode_image` are what
+        // actually act on this flag; this is purely "would every block
+        // we're about to write be empty".
+        let coeffs_skipped =
+            luma_all_zero && u_coeffs.iter().all(|&c| c == 0) && v_coeffs.iter().all(|&c| c == 0);
 
         MacroblockInfo {
             luma_mode,
-            luma_bpred: None,
+            luma_bpred,
             chroma_mode,
             segment_id: None,
             coeffs_skipped,
@@ -937,6 +1073,223 @@ impl<W: Write> Vp8Encoder<W> {
             }
         }
         sse
+    }
+
+    /// RD trial for B_PRED (4x4 sub-block) luma prediction.
+    ///
+    /// Unlike the four 16x16 candidates `trial_luma_16x16` scores
+    /// independently, the 16 sub-blocks here are *not* independent: VP8's
+    /// 4x4 intra predictors (`predict_b*pred` in `prediction.rs`) read the
+    /// reconstructed pixels immediately above and to the left of each
+    /// sub-block, and for sub-blocks inside this macroblock those
+    /// neighbours are other sub-blocks of this same macroblock. So this
+    /// walks the 16 sub-blocks in raster order - top-to-bottom,
+    /// left-to-right, the same order `transform_luma_blocks_4x4` and the
+    /// decoder use - and after picking the cheapest mode for a sub-block it
+    /// commits that sub-block's quantized/dequantized reconstruction into a
+    /// local border buffer *before* evaluating the next sub-block. Scoring
+    /// all 16 independently against the original source pixels would let
+    /// each sub-block predict from source pixels the decoder never has
+    /// (only the lossy reconstruction of its neighbours), which would
+    /// silently and permanently desync every macroblock that predicts from
+    /// this one onward - exactly the drift the module-level design notes
+    /// warn about.
+    ///
+    /// Like `trial_luma_16x16`, this never mutates `self`: the border
+    /// buffer it reconstructs into is local (seeded from, but never written
+    /// back to, `self.top_border_y` / `self.left_border_y`), and the
+    /// B_PRED submode context it reads (`self.top_b_pred` /
+    /// `self.left_b_pred`) is copied into local variables before the
+    /// per-sub-block loop starts, rather than updated in place.
+    ///
+    /// Returns:
+    /// - the summed distortion (SSE, pixel domain, same units
+    ///   `trial_luma_16x16` returns),
+    /// - the summed rate: coefficient rate (`coeff_rate_estimate`, the same
+    ///   proxy `trial_luma_16x16` uses) plus submode signalling cost
+    ///   (`bpred_mode_bit_cost`, real entropy bits - see that function's
+    ///   doc comment for why these two are on different scales and what
+    ///   that means for how `lambda` weighs them),
+    /// - the 16 chosen submodes in raster order (for
+    ///   `MacroblockInfo::luma_bpred` / `write_macroblock_header`), and
+    /// - their quantized coefficients (to test whether the macroblock can
+    ///   be signalled skipped - B_PRED has no Y2 block, so unlike
+    ///   `trial_luma_16x16`'s `Luma16x16Coeffs` there is nothing else to
+    ///   check).
+    fn trial_luma_bpred(
+        &self,
+        mbx: usize,
+        mby: usize,
+        segment: &Segment,
+        lambda: f64,
+    ) -> (i64, f64, [IntraMode; 16], LumaYCoeffs) {
+        let stride = LUMA_STRIDE;
+        let mbw = self.macroblock_width;
+        let width = usize::from(mbw * 16);
+
+        let mut y_with_border = create_border_luma(
+            mbx,
+            mby,
+            mbw.into(),
+            &self.top_border_y,
+            &self.left_border_y,
+        );
+
+        // Running B_PRED context, local copies of `self.top_b_pred` /
+        // `self.left_b_pred` updated as sub-blocks are chosen - mirrors
+        // exactly what `write_macroblock_header` does when it later writes
+        // this macroblock for real (see its `left`/`top` bookkeeping), but
+        // `top_ctx` is the only one that needs to persist and mutate across
+        // the loop: the "left" context for each row starts fresh from
+        // `self.left_b_pred[row]` (the neighbouring macroblock to the
+        // left), same as `write_macroblock_header`.
+        let mut top_ctx: [IntraMode; 4] = self.top_b_pred[mbx * 4..][..4].try_into().unwrap();
+
+        let mut total_distortion: i64 = 0;
+        let mut total_rate: f64 = 0.0;
+        let mut chosen_modes = [IntraMode::default(); 16];
+        let mut y_coeffs: LumaYCoeffs = [0i32; 16 * 16];
+
+        for sby in 0usize..4 {
+            let mut left = self.left_b_pred[sby];
+            // `sbx` indexes `top_ctx` but is also used directly to derive
+            // `x0`/`i` below, so an iterator/enumerate rewrite would need
+            // its own counter anyway.
+            #[allow(clippy::needless_range_loop)]
+            for sbx in 0usize..4 {
+                let i = sby * 4 + sbx;
+                let y0 = sby * 4 + 1;
+                let x0 = sbx * 4 + 1;
+                let top = top_ctx[sbx];
+                let y_data_block_index = (mby * 16 + sby * 4) * width + mbx * 16 + sbx * 4;
+
+                // (cost, mode, distortion, rate, quantized coeffs, the raw
+                // predicted 4x4 block, the dequantized residual) of the
+                // best candidate seen so far for this sub-block.
+                #[allow(clippy::type_complexity)]
+                let mut best: Option<(f64, IntraMode, i64, f64, [i32; 16], [u8; 16], [i32; 16])> =
+                    None;
+
+                for &mode in &Self::BPRED_MODE_CANDIDATES {
+                    // Every 4x4 predictor reads only border pixels that are
+                    // already committed - either from outside this
+                    // macroblock, or from an earlier sub-block in raster
+                    // order - and writes only its own 4x4 interior. So
+                    // trying candidates back to back on the same buffer is
+                    // safe: nothing one candidate's prediction writes is
+                    // ever read by the next candidate's prediction.
+                    match mode {
+                        IntraMode::TM => predict_tmpred(&mut y_with_border, 4, x0, y0, stride),
+                        IntraMode::VE => predict_bvepred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::HE => predict_bhepred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::DC => predict_bdcpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::LD => predict_bldpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::RD => predict_brdpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::VR => predict_bvrpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::VL => predict_bvlpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::HD => predict_bhdpred(&mut y_with_border, x0, y0, stride),
+                        IntraMode::HU => predict_bhupred(&mut y_with_border, x0, y0, stride),
+                    }
+
+                    let mut predicted_block = [0u8; 16];
+                    let mut residual = [0i32; 16];
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let border_index = (y0 + y) * stride + x0 + x;
+                            let predicted_value = y_with_border[border_index];
+                            let actual_value =
+                                self.frame.ybuf[y_data_block_index + y * width + x];
+                            predicted_block[y * 4 + x] = predicted_value;
+                            residual[y * 4 + x] =
+                                i32::from(actual_value) - i32::from(predicted_value);
+                        }
+                    }
+
+                    transform::dct4x4(&mut residual);
+
+                    // quantize
+                    let mut quantized = residual;
+                    for (index, v) in quantized.iter_mut().enumerate() {
+                        let quant = if index > 0 { segment.yac } else { segment.ydc };
+                        *v /= i32::from(quant);
+                    }
+
+                    // Dequantize and inverse-transform, matching the
+                    // round-trip `transform_luma_blocks_4x4` performs
+                    // exactly, so this trial's reconstruction is the one
+                    // the real pass (and the decoder) will actually
+                    // produce.
+                    let mut dequantized = quantized;
+                    for (index, v) in dequantized.iter_mut().enumerate() {
+                        let quant = if index > 0 { segment.yac } else { segment.ydc };
+                        *v *= i32::from(quant);
+                    }
+                    transform::idct4x4(&mut dequantized);
+
+                    let mut distortion: i64 = 0;
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let p = i32::from(predicted_block[y * 4 + x]);
+                            let r = (p + dequantized[y * 4 + x]).clamp(0, 255);
+                            let actual = i64::from(
+                                self.frame.ybuf[y_data_block_index + y * width + x],
+                            );
+                            let d = i64::from(r) - actual;
+                            distortion += d * d;
+                        }
+                    }
+
+                    let coeff_rate = coeff_rate_estimate(&quantized) as f64;
+                    let submode_rate = bpred_mode_bit_cost(top, left, mode);
+                    let rate = coeff_rate + submode_rate;
+                    let cost = distortion as f64 + lambda * rate;
+
+                    let better = match &best {
+                        None => true,
+                        Some((best_cost, ..)) => cost < *best_cost,
+                    };
+                    if better {
+                        best = Some((
+                            cost,
+                            mode,
+                            distortion,
+                            rate,
+                            quantized,
+                            predicted_block,
+                            dequantized,
+                        ));
+                    }
+                }
+
+                let (_, mode, distortion, rate, quantized, predicted_block, dequantized) =
+                    best.expect("BPRED_MODE_CANDIDATES is non-empty");
+
+                // Commit the winning sub-block's reconstruction into the
+                // shared border buffer before moving on to the next
+                // sub-block - this is exactly what makes later sub-blocks
+                // (and, once this mode is chosen for real, later
+                // macroblocks) predict from the same lossy reconstruction
+                // the decoder will have, rather than from source pixels.
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let border_index = (y0 + y) * stride + x0 + x;
+                        let p = i32::from(predicted_block[y * 4 + x]);
+                        y_with_border[border_index] =
+                            (p + dequantized[y * 4 + x]).clamp(0, 255) as u8;
+                    }
+                }
+
+                chosen_modes[i] = mode;
+                y_coeffs[i * 16..][..16].copy_from_slice(&quantized);
+                total_distortion += distortion;
+                total_rate += rate;
+
+                left = mode;
+                top_ctx[sbx] = mode;
+            }
+        }
+
+        (total_distortion, total_rate, chosen_modes, y_coeffs)
     }
 
     /// RD trial for one candidate chroma prediction mode, covering both U
