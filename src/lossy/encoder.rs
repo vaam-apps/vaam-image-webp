@@ -1079,7 +1079,39 @@ impl<W: Write> Vp8Encoder<W> {
             pixel_type: 0,
 
             filter_type: false,
-            filter_level: 63,
+            // MUST stay 0 until the encoder applies the loop filter to its
+            // own reconstruction.
+            //
+            // VP8's loop filter is *in-loop*: the decoder filters each
+            // reconstructed macroblock before later macroblocks predict from
+            // it. This encoder never does - `loop_filter::` is called only
+            // from the decoder, in `lossy/mod.rs` - so it predicts from
+            // unfiltered pixels while the decoder predicts from filtered
+            // ones. Signalling a non-zero level guarantees encoder/decoder
+            // drift, and the drift grows with the level.
+            //
+            // This was hardcoded to 63, the maximum, which maximised it.
+            // Measured with examples/rd_eval.rs on six Kodak images at three
+            // DSSIM targets, size relative to libwebp (lower is better):
+            //
+            //     image      <=0.0150        <=0.0080        <=0.0035
+            //     kodim01  1.51 -> 1.38    1.64 -> 1.58    1.97 -> 1.97
+            //     kodim02  1.57 -> 1.57    1.51 -> 1.45    2.03 -> 1.71
+            //     kodim03  1.89 -> 1.89    1.92 -> 1.92    2.19 -> 2.19
+            //     kodim05  2.25 -> 2.09    2.41 -> 2.25    2.65 -> 2.53
+            //     kodim13  1.99 -> 1.86    2.09 -> 2.09    2.33 -> 2.20
+            //     kodim19  1.74 -> 1.69    1.79 -> 1.79    2.10 -> 1.97
+            //
+            // Mean -4.0%, median -3.8%, best -15.8%, and worse on 0 of 18
+            // points. A monotonic sweep (0, 8, 16, 32, 63) confirms the cost
+            // rises with the level, which is the drift signature rather than
+            // a quality trade.
+            //
+            // The real fix is to filter the reconstruction here and then
+            // derive a level from the quantiser the way libwebp does; that
+            // should beat 0, because the filter exists to help prediction.
+            // Until then 0 is the only value that is not actively wrong.
+            filter_level: 0,
             sharpness_level: 7,
         };
 
