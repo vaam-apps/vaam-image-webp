@@ -2,7 +2,7 @@ use std::io::Write;
 
 use byteorder_lite::{LittleEndian, WriteBytesExt};
 
-use super::arithmetic_encoder::ArithmeticEncoder;
+use super::arithmetic_encoder::{tree_encode_path, ArithmeticEncoder};
 use super::common::*;
 use super::prediction::*;
 use super::transform;
@@ -251,6 +251,274 @@ fn skip_probability(skipped: u32, total: u32) -> u8 {
     scaled.clamp(1, 255) as u8
 }
 
+// --- Coefficient token probability adaptation -------------------------------
+//
+// A keyframe header may override any of the ~1056 coefficient token
+// probabilities (`token_probs[plane][band][context][node]`,
+// `TokenProbTables`) away from the `COEFF_PROBS` default, at a per-value
+// cost of one flag bit plus, when set, 8 more bits (`encode_updated_token_
+// probabilities`). `collect_token_counts` runs the frame once (dry, like
+// `count_skipped_macroblocks`) to learn how often each branch of the
+// coefficient token tree is actually taken in each bucket;
+// `derive_updated_token_probs` turns those counts into the final
+// `token_probs` table used both to encode the residual data and to fill in
+// the header, by updating only where the measured bits saved outweigh the
+// signalling cost.
+
+/// One coefficient-token coding event within a block, as produced by
+/// [`tokenize_block`]: which `(band, context)` bucket of
+/// `token_probs[plane]` it reads probabilities from, the DCT token coded (a
+/// `DCT_*` constant, or `DCT_EOB`), and the token tree's start index. That
+/// index is `2` right after a zero coefficient (two zeros in a row can never
+/// be followed by an end-of-block that the decoder couldn't have inferred by
+/// just ending the block at the first one, see `write_with_tree_start_index`)
+/// and `0` otherwise. `quantized_value` is the signed quantized coefficient;
+/// only the real encode path needs it, to derive the sign bit and category
+/// "extra" bits (both coded with fixed, non-adapted probabilities), and the
+/// token-statistics pass ignores it.
+struct TokenEvent {
+    band: usize,
+    context: usize,
+    token: i8,
+    start_index: usize,
+    quantized_value: i32,
+}
+
+/// Quantizes, zigzags, and walks one block's coefficients, returning the
+/// sequence of token-tree coding events (see `TokenEvent`) plus whether the
+/// block has any non-zero coefficient (the `has_coeffs` complexity-context
+/// bookkeeping `encode_residual_data` threads between blocks).
+///
+/// Pulled out of `encode_coefficients` so the real encode path and the
+/// token-probability statistics dry run (`Vp8Encoder::collect_token_counts`)
+/// tokenize every block identically - two independent copies of this logic
+/// could silently drift apart, which would desync the probabilities the
+/// header advertises from what the residual partitions actually use.
+fn tokenize_block(
+    block: &[i32; 16],
+    plane: Plane,
+    complexity: usize,
+    dc_quant: i16,
+    ac_quant: i16,
+) -> (Vec<TokenEvent>, bool) {
+    let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
+
+    assert!(complexity <= 2);
+    let mut complexity = complexity;
+
+    // convert to zigzag and quantize
+    // this is the only lossy part of the encoding
+    let mut zigzag_block = [0i32; 16];
+    for i in first_coeff..16 {
+        let zigzag_index = usize::from(ZIGZAG[i]);
+        let quant = if zigzag_index > 0 { ac_quant } else { dc_quant };
+        zigzag_block[i] = block[zigzag_index] / i32::from(quant);
+    }
+
+    // get index of last coefficient that isn't 0
+    let end_of_block_index =
+        if let Some(last_non_zero_index) = zigzag_block.iter().rev().position(|x| *x != 0) {
+            (15 - last_non_zero_index) + 1
+        } else {
+            // if it's all 0s then the first block is end of block
+            0
+        };
+
+    let mut events = Vec::new();
+    let mut skip_eob = false;
+
+    for index in first_coeff..end_of_block_index {
+        let coeff = zigzag_block[index];
+
+        let band = usize::from(COEFF_BANDS[index]);
+        let start_index = if skip_eob { 2 } else { 0 };
+
+        let token = match coeff.abs() {
+            0 => {
+                // never going to have an end of block after a 0, so skip checking next coeff
+                skip_eob = true;
+                DCT_0
+            }
+
+            // just encode as literal
+            literal @ 1..=4 => {
+                skip_eob = false;
+                literal as i8
+            }
+
+            // encode the category
+            value => {
+                skip_eob = false;
+                match value {
+                    5..=6 => DCT_CAT1,
+                    7..=10 => DCT_CAT2,
+                    11..=18 => DCT_CAT3,
+                    19..=34 => DCT_CAT4,
+                    35..=66 => DCT_CAT5,
+                    67..=2048 => DCT_CAT6,
+                    _ => unreachable!(),
+                }
+            }
+        };
+
+        events.push(TokenEvent {
+            band,
+            context: complexity,
+            token,
+            start_index,
+            quantized_value: coeff,
+        });
+
+        complexity = match token {
+            DCT_0 => 0,
+            DCT_1 => 1,
+            _ => 2,
+        };
+    }
+
+    // encode end of block
+    if end_of_block_index < 16 {
+        let band_index = usize::max(first_coeff, end_of_block_index);
+        let band = usize::from(COEFF_BANDS[band_index]);
+        events.push(TokenEvent {
+            band,
+            context: complexity,
+            token: DCT_EOB,
+            start_index: 0,
+            quantized_value: 0,
+        });
+    }
+
+    (events, end_of_block_index > 0)
+}
+
+/// Per-`(plane, band, context)` bucket branch counts for every internal node
+/// of the coefficient token tree (`DCT_TOKEN_TREE`): `[false_count,
+/// true_count]` for `token_probs[plane][band][context][node]`. Same shape as
+/// `TokenProbTables`, but counting how often each branch was actually taken
+/// this frame instead of holding a probability. Built by
+/// `Vp8Encoder::collect_token_counts`, consumed by
+/// `derive_updated_token_probs`.
+type TokenCounts = [[[[[u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
+
+/// Adds one block's tokenization (see `tokenize_block`) into `counts`, by
+/// replaying the exact same root-to-leaf tree walk
+/// `write_with_tree_start_index` performs when actually writing a token
+/// (`tree_encode_path`) and counting each branch instead of encoding it.
+fn accumulate_token_events(counts: &mut TokenCounts, plane: Plane, events: &[TokenEvent]) {
+    for event in events {
+        for (bit, prob_index) in tree_encode_path(&DCT_TOKEN_TREE, event.token, event.start_index)
+        {
+            counts[plane as usize][event.band][event.context][prob_index][usize::from(bit)] += 1;
+        }
+    }
+}
+
+/// Buckets with fewer than this many combined true/false observations keep
+/// `COEFF_PROBS`'s default outright, without even computing a candidate
+/// probability for them.
+///
+/// Below about 20 samples, the standard error of a binomial proportion
+/// (`~1 / (2*sqrt(n))`, so +-11% at n=20) is large enough that the rounded
+/// 1..=255 estimate mostly reflects which way this particular handful of
+/// coefficients happened to fall, not a skew that will hold up over the rest
+/// of the bucket's - mostly still-to-be-seen, since 20 is a small fraction of
+/// a macroblock grid - occurrences. The bit-cost comparison in
+/// `derive_updated_token_probs` is the real gatekeeper regardless (a sparse
+/// bucket's total savings can't realistically outrun the flag + 8-bit
+/// signalling cost), but this threshold avoids computing a confident-looking,
+/// wildly extreme estimate (e.g. 255 from a 3/3 split) from a handful of
+/// samples in the first place.
+const MIN_TOKEN_PROB_OBSERVATIONS: u64 = 20;
+
+/// Real entropy cost, in bits, of coding `false_count` "false" branches and
+/// `true_count` "true" branches with a fixed probability `prob` (VP8
+/// convention: `prob` is `P(branch is false)`, scaled to 0..=255) - i.e.
+/// `false_count` uses of `branch_bit_cost(prob, false)` plus `true_count`
+/// uses of `branch_bit_cost(prob, true)`, added up instead of walked one
+/// branch at a time.
+fn total_branch_bit_cost(false_count: u64, true_count: u64, prob: Prob) -> f64 {
+    false_count as f64 * branch_bit_cost(prob, false) + true_count as f64 * branch_bit_cost(prob, true)
+}
+
+/// Decides, from `counts` (see `Vp8Encoder::collect_token_counts`), which of
+/// the frame header's ~1056 coefficient probabilities are worth overriding
+/// away from `COEFF_PROBS`, and returns the resulting table - used both to
+/// fill in the header (`Vp8Encoder::encode_updated_token_probabilities`) and,
+/// unchanged, as `self.token_probs` for the real encode pass, so the two
+/// can never disagree.
+///
+/// For each bucket with enough observations (`MIN_TOKEN_PROB_OBSERVATIONS`),
+/// the candidate probability is the rounded-to-nearest, clamped-to-1..=255
+/// maximum-likelihood estimate from the counts (`skip_probability` uses the
+/// same rounding convention, for the same reason: keep clear of the
+/// unrepresentable 0/256 edges). That estimate minimises the coding cost of
+/// exactly the branches observed this frame - by definition, cross-entropy
+/// against an empirical distribution is minimised by coding with that same
+/// distribution - so updating is never a *worse* fit for the data; the only
+/// question is whether the fit is good enough to be worth paying for.
+///
+/// Sending the update costs the flag bit (coded `true`, at
+/// `COEFF_UPDATE_PROBS`'s own probability for this node) plus a fixed 8 bits
+/// for the new value; not sending it costs the flag bit alone (coded
+/// `false`). Both sides are computed in real bits (`total_branch_bit_cost`,
+/// `-log2(p)`), and the update is only taken when it comes out cheaper
+/// overall:
+///
+/// ```text
+/// cost(update)    = flag_cost(true)  + 8 + bits(candidate_prob)
+/// cost(no update) = flag_cost(false)     + bits(default_prob)
+/// update iff bits(default_prob) - bits(candidate_prob) > 8 + flag_cost(true) - flag_cost(false)
+/// ```
+///
+/// i.e. the real bits saved on the token stream must exceed the net extra
+/// cost of signalling "yes, update" instead of "no". A blanket "always
+/// update" - flag cost aside - is wrong on its own merits too: for a
+/// low-observation bucket the 8-bit literal alone usually costs more than
+/// the tiny stream savings it buys, which is why most of the ~1056
+/// probabilities are expected to stay at their default.
+fn derive_updated_token_probs(counts: &TokenCounts) -> TokenProbTables {
+    let mut probs = COEFF_PROBS;
+
+    for (i, counts_i) in counts.iter().enumerate() {
+        for (j, counts_j) in counts_i.iter().enumerate() {
+            for (k, counts_k) in counts_j.iter().enumerate() {
+                for (l, &[false_count, true_count]) in counts_k.iter().enumerate() {
+                    let total = false_count + true_count;
+                    if total < MIN_TOKEN_PROB_OBSERVATIONS {
+                        continue;
+                    }
+
+                    let default_prob = COEFF_PROBS[i][j][k][l];
+                    let scaled = (256 * false_count + total / 2) / total;
+                    let candidate_prob = scaled.clamp(1, 255) as u8;
+
+                    if candidate_prob == default_prob {
+                        continue;
+                    }
+
+                    let bits_with_default =
+                        total_branch_bit_cost(false_count, true_count, default_prob);
+                    let bits_with_candidate =
+                        total_branch_bit_cost(false_count, true_count, candidate_prob);
+                    let savings = bits_with_default - bits_with_candidate;
+
+                    let update_flag_prob = COEFF_UPDATE_PROBS[i][j][k][l];
+                    let flag_cost_true = total_branch_bit_cost(0, 1, update_flag_prob);
+                    let flag_cost_false = total_branch_bit_cost(1, 0, update_flag_prob);
+                    let overhead = 8.0 + flag_cost_true - flag_cost_false;
+
+                    if savings > overhead {
+                        probs[i][j][k][l] = candidate_prob;
+                    }
+                }
+            }
+        }
+    }
+
+    probs
+}
+
 struct Vp8Encoder<W> {
     writer: W,
     frame: Frame,
@@ -437,14 +705,29 @@ impl<W: Write> Vp8Encoder<W> {
             .write_optional_signed_value(4, self.quantization_indices.uvac_delta);
     }
 
-    // TODO: work out when we want to update these probabilities
+    /// Encodes the coefficient-probability updates (9.9/13.4) for this
+    /// frame's header: per `(plane, band, context, node)`, a flag for
+    /// whether the probability used to encode this frame's residual data
+    /// differs from the `COEFF_PROBS` default a keyframe decoder always
+    /// starts from, followed by the new 8-bit value when it does.
+    ///
+    /// `self.token_probs` must already hold exactly the probabilities
+    /// `encode_coefficients` used - set by `derive_updated_token_probs` in
+    /// `encode_image`, before this is called - since whatever is written
+    /// here is what the decoder will use to read every coefficient in the
+    /// residual partitions. See that function's doc comment for how the
+    /// per-probability update decision itself is made.
     fn encode_updated_token_probabilities(&mut self) {
-        for is in COEFF_UPDATE_PROBS.iter() {
-            for js in is.iter() {
-                for ks in js.iter() {
-                    for prob in ks.iter() {
-                        // currently just not updating these
-                        self.encoder.write_bool(false, *prob);
+        for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
+            for (j, js) in is.iter().enumerate() {
+                for (k, ks) in js.iter().enumerate() {
+                    for (l, update_flag_prob) in ks.iter().enumerate() {
+                        let new_prob = self.token_probs[i][j][k][l];
+                        let update = new_prob != COEFF_PROBS[i][j][k][l];
+                        self.encoder.write_bool(update, *update_flag_prob);
+                        if update {
+                            self.encoder.write_literal(8, new_prob);
+                        }
                     }
                 }
             }
@@ -653,140 +936,55 @@ impl<W: Write> Vp8Encoder<W> {
         dc_quant: i16,
         ac_quant: i16,
     ) -> bool {
-        // transform block
-        // dc is used for the 0th coefficient, ac for the others
+        let (events, has_coeffs) = tokenize_block(block, plane, complexity, dc_quant, ac_quant);
 
         let encoder = &mut self.partitions[partition_index];
-
-        let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
         let probs = &self.token_probs[plane as usize];
 
-        assert!(complexity <= 2);
-        let mut complexity = complexity;
+        for event in &events {
+            let token_probs = &probs[event.band][event.context];
+            encoder.write_with_tree_start_index(
+                &DCT_TOKEN_TREE,
+                token_probs,
+                event.token,
+                event.start_index,
+            );
 
-        // convert to zigzag and quantize
-        // this is the only lossy part of the encoding
-        let mut zigzag_block = [0i32; 16];
-        for i in first_coeff..16 {
-            let zigzag_index = usize::from(ZIGZAG[i]);
-            let quant = if zigzag_index > 0 { ac_quant } else { dc_quant };
-            zigzag_block[i] = block[zigzag_index] / i32::from(quant);
-        }
-
-        // get index of last coefficient that isn't 0
-        let end_of_block_index =
-            if let Some(last_non_zero_index) = zigzag_block.iter().rev().position(|x| *x != 0) {
-                (15 - last_non_zero_index) + 1
-            } else {
-                // if it's all 0s then the first block is end of block
-                0
-            };
-
-        let mut skip_eob = false;
-
-        for index in first_coeff..end_of_block_index {
-            let coeff = zigzag_block[index];
-
-            let band = usize::from(COEFF_BANDS[index]);
-            let probabilities = &probs[band][complexity];
-            let start_index_token_tree = if skip_eob { 2 } else { 0 };
-            let token_tree = &DCT_TOKEN_TREE;
-            let token_probs = probabilities;
-
-            let token = match coeff.abs() {
-                0 => {
-                    encoder.write_with_tree_start_index(
-                        token_tree,
-                        token_probs,
-                        DCT_0,
-                        start_index_token_tree,
-                    );
-
-                    // never going to have an end of block after a 0, so skip checking next coeff
-                    skip_eob = true;
-                    DCT_0
-                }
-
-                // just encode as literal
-                literal @ 1..=4 => {
-                    encoder.write_with_tree_start_index(
-                        token_tree,
-                        token_probs,
-                        literal as i8,
-                        start_index_token_tree,
-                    );
-
-                    skip_eob = false;
-                    literal as i8
-                }
-
-                // encode the category
-                value => {
-                    let category = match value {
-                        5..=6 => DCT_CAT1,
-                        7..=10 => DCT_CAT2,
-                        11..=18 => DCT_CAT3,
-                        19..=34 => DCT_CAT4,
-                        35..=66 => DCT_CAT5,
-                        67..=2048 => DCT_CAT6,
-                        _ => unreachable!(),
-                    };
-
-                    encoder.write_with_tree_start_index(
-                        token_tree,
-                        token_probs,
-                        category,
-                        start_index_token_tree,
-                    );
-
-                    let category_probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
-
-                    let extra = value - i32::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]);
-
-                    let mut mask = if category == DCT_CAT6 {
-                        1 << (11 - 1)
-                    } else {
-                        1 << (category - DCT_CAT1)
-                    };
-
-                    for &prob in category_probs.iter() {
-                        if prob == 0 {
-                            break;
-                        }
-                        let extra_bool = extra & mask > 0;
-                        encoder.write_bool(extra_bool, prob);
-                        mask >>= 1;
-                    }
-
-                    skip_eob = false;
-
-                    category
-                }
-            };
-
-            // encode sign if token is not zero
-            if token != DCT_0 {
-                // note flag means coeff is negative
-                encoder.write_flag(!coeff.is_positive());
+            if event.token == DCT_EOB || event.token == DCT_0 {
+                continue;
             }
 
-            complexity = match token {
-                DCT_0 => 0,
-                DCT_1 => 1,
-                _ => 2,
-            };
-        }
+            // category tokens carry extra "which value in the category"
+            // bits, coded with the fixed (never adapted) `PROB_DCT_CAT`
+            // probabilities - same as `read_coefficients` in the decoder.
+            if event.token >= DCT_CAT1 {
+                let category = event.token;
+                let category_probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
+                let value = event.quantized_value.abs();
+                let extra = value - i32::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]);
 
-        // encode end of block
-        if end_of_block_index < 16 {
-            let band_index = usize::max(first_coeff, end_of_block_index);
-            let band = usize::from(COEFF_BANDS[band_index]);
-            let probabilities = &probs[band][complexity];
-            encoder.write_with_tree(&DCT_TOKEN_TREE, probabilities, DCT_EOB);
+                let mut mask = if category == DCT_CAT6 {
+                    1 << (11 - 1)
+                } else {
+                    1 << (category - DCT_CAT1)
+                };
+
+                for &prob in category_probs.iter() {
+                    if prob == 0 {
+                        break;
+                    }
+                    let extra_bool = extra & mask > 0;
+                    encoder.write_bool(extra_bool, prob);
+                    mask >>= 1;
+                }
+            }
+
+            // note flag means coeff is negative
+            encoder.write_flag(!event.quantized_value.is_positive());
         }
 
         // whether the block has a non zero coefficient
-        end_of_block_index > 0
+        has_coeffs
     }
 
     fn encode_image(
@@ -828,6 +1026,18 @@ impl<W: Write> Vp8Encoder<W> {
         let (skipped, total) = self.count_skipped_macroblocks();
         self.reset_frame_state();
         self.macroblock_no_skip_coeff = Some(skip_probability(skipped, total));
+
+        // Same reasoning, for the coefficient token probabilities this time:
+        // `encode_compressed_frame_header` (below) has to advertise them
+        // before any residual data is written, so learn the real per-bucket
+        // token statistics with one more dry run and derive the frame's
+        // `token_probs` from them now. `encode_coefficients` reads
+        // `self.token_probs` directly, so setting it here is what makes the
+        // real pass below use exactly what the header just advertised - see
+        // `derive_updated_token_probs` for the update decision itself.
+        let token_counts = self.collect_token_counts();
+        self.reset_frame_state();
+        self.token_probs = derive_updated_token_probs(&token_counts);
 
         self.encode_compressed_frame_header();
 
@@ -1403,6 +1613,173 @@ impl<W: Write> Vp8Encoder<W> {
         (skipped, total)
     }
 
+    /// Dry run of the whole frame's macroblock loop, counting how often each
+    /// branch of the coefficient token tree is taken per `(plane, band,
+    /// context)` bucket (`TokenCounts`) - the statistics
+    /// `derive_updated_token_probs` turns into the frame header's
+    /// coefficient probability updates.
+    ///
+    /// Same two-pass shape as `count_skipped_macroblocks` just above, and for
+    /// the same reason: mode decision and reconstruction only depend on
+    /// pixel data and border state, never on entropy-coding probabilities
+    /// (see that method's doc comment), so this can run mode decision for
+    /// real, tokenize every block's actual coefficients
+    /// (`accumulate_residual_token_counts` / `tokenize_block`), and still be
+    /// guaranteed to count exactly the tokens the real encode pass will
+    /// later emit - before the header that has to carry the result is
+    /// written. The border/b_pred/complexity state this mutates is fully
+    /// reset by `reset_frame_state` immediately afterwards, same as after
+    /// `count_skipped_macroblocks`.
+    fn collect_token_counts(&mut self) -> TokenCounts {
+        let mut counts: TokenCounts = [[[[[0u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
+
+        for mby in 0..self.macroblock_height {
+            self.left_complexity = Complexity::default();
+            self.left_b_pred = [IntraMode::default(); 4];
+            self.left_border_y = [129u8; 16 + 1];
+            self.left_border_u = [129u8; 8 + 1];
+            self.left_border_v = [129u8; 8 + 1];
+
+            for mbx in 0..self.macroblock_width {
+                let mbx = usize::from(mbx);
+                let mby = usize::from(mby);
+                let info = self.choose_macroblock_info(mbx, mby);
+
+                let y_block_data = self.transform_luma_block(mbx, mby, &info);
+                let (u_block_data, v_block_data) =
+                    self.transform_chroma_blocks(mbx, mby, info.chroma_mode);
+
+                if info.coeffs_skipped {
+                    // matches `encode_image`'s handling of a skipped
+                    // macroblock: no residual data (and so no tokens) is
+                    // ever coded for it, but the complexity context it
+                    // leaves for its neighbours is still all-zero.
+                    self.left_complexity.clear(info.luma_mode != LumaMode::B);
+                    self.top_complexity[mbx].clear(info.luma_mode != LumaMode::B);
+                    continue;
+                }
+
+                self.accumulate_residual_token_counts(
+                    &info,
+                    mbx,
+                    &y_block_data,
+                    &u_block_data,
+                    &v_block_data,
+                    &mut counts,
+                );
+            }
+        }
+
+        counts
+    }
+
+    /// Tokenizes and counts one non-skipped macroblock's residual data into
+    /// `counts` - the statistics-only counterpart of `encode_residual_data`,
+    /// which this mirrors block for block (Y2, then the 16 luma sub-blocks,
+    /// then chroma), including its left/top complexity-context threading,
+    /// so the `(band, context)` bucket each token is counted into is exactly
+    /// the one `encode_coefficients` will use for that same coefficient in
+    /// the real pass.
+    fn accumulate_residual_token_counts(
+        &mut self,
+        macroblock_info: &MacroblockInfo,
+        mbx: usize,
+        y_block_data: &[i32; 16 * 16],
+        u_block_data: &[i32; 16 * 4],
+        v_block_data: &[i32; 16 * 4],
+        counts: &mut TokenCounts,
+    ) {
+        let mut plane = if macroblock_info.luma_mode == LumaMode::B {
+            Plane::YCoeff0
+        } else {
+            Plane::Y2
+        };
+
+        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
+
+        if plane == Plane::Y2 {
+            let mut coeffs0 = get_coeffs0_from_block(y_block_data);
+            transform::wht4x4(&mut coeffs0);
+
+            let complexity = self.left_complexity.y2 + self.top_complexity[mbx].y2;
+            let (events, has_coeffs) = tokenize_block(
+                &coeffs0,
+                Plane::Y2,
+                complexity.into(),
+                segment.y2dc,
+                segment.y2ac,
+            );
+            accumulate_token_events(counts, Plane::Y2, &events);
+
+            self.left_complexity.y2 = if has_coeffs { 1 } else { 0 };
+            self.top_complexity[mbx].y2 = if has_coeffs { 1 } else { 0 };
+
+            plane = Plane::YCoeff1;
+        }
+
+        for y in 0usize..4 {
+            let mut left = self.left_complexity.y[y];
+            for x in 0..4 {
+                let block = y_block_data[y * 4 * 16 + x * 16..][..16]
+                    .try_into()
+                    .unwrap();
+
+                let top = self.top_complexity[mbx].y[x];
+                let complexity = left + top;
+
+                let (events, has_coeffs) =
+                    tokenize_block(block, plane, complexity.into(), segment.ydc, segment.yac);
+                accumulate_token_events(counts, plane, &events);
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].y[x] = if has_coeffs { 1 } else { 0 };
+            }
+            self.left_complexity.y[y] = left;
+        }
+
+        plane = Plane::Chroma;
+
+        for y in 0usize..2 {
+            let mut left = self.left_complexity.u[y];
+            for x in 0usize..2 {
+                let block = u_block_data[y * 2 * 16 + x * 16..][..16]
+                    .try_into()
+                    .unwrap();
+
+                let top = self.top_complexity[mbx].u[x];
+                let complexity = left + top;
+
+                let (events, has_coeffs) =
+                    tokenize_block(block, plane, complexity.into(), segment.uvdc, segment.uvac);
+                accumulate_token_events(counts, plane, &events);
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].u[x] = if has_coeffs { 1 } else { 0 };
+            }
+            self.left_complexity.u[y] = left;
+        }
+
+        for y in 0usize..2 {
+            let mut left = self.left_complexity.v[y];
+            for x in 0usize..2 {
+                let block = v_block_data[y * 2 * 16 + x * 16..][..16]
+                    .try_into()
+                    .unwrap();
+
+                let top = self.top_complexity[mbx].v[x];
+                let complexity = left + top;
+
+                let (events, has_coeffs) =
+                    tokenize_block(block, plane, complexity.into(), segment.uvdc, segment.uvac);
+                accumulate_token_events(counts, plane, &events);
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].v[x] = if has_coeffs { 1 } else { 0 };
+            }
+            self.left_complexity.v[y] = left;
+        }
+    }
+
     // sets up the encoding of the encoder by setting all the encoder params based on the width and height
     fn setup_encoding(
         &mut self,
@@ -1501,10 +1878,12 @@ impl<W: Write> Vp8Encoder<W> {
 
     /// Resets every piece of per-frame encoding state that prediction reads
     /// (borders, B_PRED context, coefficient complexity) back to its
-    /// initial, "no macroblocks encoded yet" values. Called both from
-    /// `setup_encoding` (first use) and from `encode_image` after the dry
-    /// `count_skipped_macroblocks` pass (which mutates all of this exactly
-    /// like the real pass would, and must not leak into it).
+    /// initial, "no macroblocks encoded yet" values. Called from
+    /// `setup_encoding` (first use) and from `encode_image` after each of
+    /// its two dry runs - `count_skipped_macroblocks` and
+    /// `collect_token_counts` - both of which mutate all of this exactly
+    /// like the real pass would, and must not leak into it or into each
+    /// other.
     fn reset_frame_state(&mut self) {
         let mb_width = self.macroblock_width;
 

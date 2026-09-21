@@ -115,44 +115,8 @@ impl ArithmeticEncoder {
         start_index: usize,
     ) {
         assert_eq!(tree.len(), probabilities.len() * 2);
-        // the values are encoded as negative or zero in the tree, positive values are indexes
-        let mut current_index = tree.iter().position(|x| *x == -value).unwrap();
-
-        let mut to_encode: Vec<(bool, u8)> = vec![];
-
-        loop {
-            if current_index == start_index {
-                // just write the 0 using the prob
-                to_encode.push((false, probabilities[current_index / 2]));
-                break;
-            }
-            if current_index == start_index + 1 {
-                to_encode.push((true, probabilities[current_index / 2]));
-                break;
-            }
-
-            // even => encode false
-            let encode_val = if current_index % 2 == 0 {
-                false
-            } else {
-                current_index -= 1;
-                true
-            };
-
-            to_encode.push((encode_val, probabilities[current_index / 2]));
-
-            let previous_index = tree
-                .iter()
-                .position(|x| *x == (current_index as i8))
-                .unwrap_or_else(|| {
-                    panic!("Failed to encode {value} for tree {tree:?} and probs {probabilities:?}")
-                });
-            current_index = previous_index;
-        }
-
-        // write bools backwards
-        for (encode_bool, prob) in to_encode.iter().rev() {
-            self.write_bool(*encode_bool, *prob);
+        for (encode_bool, prob_index) in tree_encode_path(tree, value, start_index) {
+            self.write_bool(encode_bool, probabilities[prob_index]);
         }
     }
 
@@ -177,6 +141,59 @@ impl ArithmeticEncoder {
         }
         self.writer
     }
+}
+
+/// Walks `tree` from the leaf coding `value` back up to `start_index`,
+/// exactly like `write_with_tree_start_index` did inline before this was
+/// pulled out, but returns the sequence of `(bit, probabilities index)`
+/// pairs - in the order they must be written - instead of writing them
+/// through an `ArithmeticEncoder`.
+///
+/// Shared by `write_with_tree_start_index` (the real encode path) and the
+/// token-probability statistics dry run in `encoder.rs`
+/// (`accumulate_token_events`), so the bits actually written and the counts
+/// used to decide the header's probability updates can never tokenize a
+/// tree differently.
+pub(crate) fn tree_encode_path(tree: &[i8], value: i8, start_index: usize) -> Vec<(bool, usize)> {
+    // the values are encoded as negative or zero in the tree, positive values are indexes
+    let mut current_index = tree.iter().position(|x| *x == -value).unwrap();
+
+    let mut to_encode: Vec<(bool, usize)> = vec![];
+
+    loop {
+        if current_index == start_index {
+            // just write the 0 using the prob
+            to_encode.push((false, current_index / 2));
+            break;
+        }
+        if current_index == start_index + 1 {
+            to_encode.push((true, current_index / 2));
+            break;
+        }
+
+        // even => encode false
+        let encode_val = if current_index % 2 == 0 {
+            false
+        } else {
+            current_index -= 1;
+            true
+        };
+
+        to_encode.push((encode_val, current_index / 2));
+
+        let previous_index = tree
+            .iter()
+            .position(|x| *x == (current_index as i8))
+            .unwrap_or_else(|| {
+                panic!("Failed to encode {value} for tree {tree:?} starting at index {start_index}")
+            });
+        current_index = previous_index;
+    }
+
+    // bits must be written from the root down to the leaf, which is the
+    // reverse of the leaf-to-root order they were pushed in above.
+    to_encode.reverse();
+    to_encode
 }
 
 #[cfg(test)]
