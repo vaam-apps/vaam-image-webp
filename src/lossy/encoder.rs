@@ -23,17 +23,6 @@ struct Complexity {
     v: [u8; 2],
 }
 
-impl Complexity {
-    fn clear(&mut self, include_y2: bool) {
-        self.y = [0; 4];
-        self.u = [0; 2];
-        self.v = [0; 2];
-        if include_y2 {
-            self.y2 = 0;
-        }
-    }
-}
-
 #[derive(Default)]
 struct QuantizationIndices {
     yac_abs: u8,
@@ -229,6 +218,59 @@ fn mode_decision_lambda(segment: &Segment) -> f64 {
     LAMBDA_SCALE * qstep * qstep
 }
 
+/// `trellis_quantize_block` prices rate in real bits (`coeff_token_bit_cost`),
+/// not `coeff_rate_estimate`'s cheap proxy, so reusing `mode_decision_lambda`
+/// unchanged would under-weight rate by roughly the same factor that made
+/// `LAMBDA_SCALE` smaller than the classical bit-domain constant in the first
+/// place (see `mode_decision_lambda`'s doc comment). On top of that, trellis
+/// measures distortion in the *transform* domain, not the pixel domain
+/// `mode_decision_lambda` was calibrated against; per the module doc comment
+/// above `trellis_quantize_block`, transform-domain SSE is pixel-domain SSE
+/// scaled by the transform's energy gain `c` (`T^T T = c*I`). For this
+/// crate's `dct4x4`/`wht4x4`, `c` measures at ~4.0 (checked numerically:
+/// impulse coefficients through `idct4x4`, coefficient-domain energy over
+/// reconstructed pixel-domain energy comes out to 4.00-4.02 at every
+/// position), so a lambda calibrated for real bits against pixel-domain SSE
+/// needs dividing by ~4, then multiplying back up by whatever factor
+/// `LAMBDA_SCALE` shrank it by relative to the classical real-bit constant.
+///
+/// `TRELLIS_LAMBDA_MULTIPLIER` is that combined correction, found by
+/// sweeping it rather than re-deriving it analytically - the domain-
+/// conversion factors above explain its rough size, but `LAMBDA_SCALE`
+/// itself is already an empirical fit, not a first-principles constant, so
+/// their product is not expected to be exact.
+///
+/// Two things measured this, not one, because they disagree in an
+/// instructive way: at fixed quality (`examples/quick_size`'s byte counts),
+/// size keeps dropping well past this value, monotonically, all the way to
+/// `TRELLIS_LAMBDA_MULTIPLIER = 50` and beyond - trellis is, correctly,
+/// always willing to trade more distortion for fewer bits as lambda grows.
+/// But `examples/rd_eval` measures size at *matched DSSIM*, and there the
+/// picture is different: below ~3 trellis has essentially no effect (every
+/// candidate's real bit-cost saving is too small to outweigh its transform-
+/// domain distortion at that lambda, so the search always reproduces plain
+/// scalar quantization); by 12 the median ours/libwebp ratio is clearly
+/// *worse* than plain scalar (1.49x/1.47x/1.41x vs the 1.26x/1.24x/1.31x
+/// baseline) - past some point, the specific coefficients trellis zeroes to
+/// save bits (favouring smaller, cheaper-to-signal AC terms) cost DSSIM
+/// disproportionately more than the alternative scalar quantization takes
+/// to reach the same nominal quality index by other means. 4 is the value
+/// in between that measured as a small, consistent win with no regression
+/// on any of the three DSSIM targets (1.256x/1.243x/1.295x vs baseline
+/// 1.256x/1.244x/1.307x on the six-image Kodak sweep this crate uses for
+/// `examples/rd_eval` - see the commit message for the full run). A wider
+/// search (finer steps, a per-plane split - e.g. protecting the Y2/DC block
+/// with a smaller lambda than the AC blocks, which a quick check found made
+/// no measurable difference at this corpus size - or a genuinely different
+/// distortion model) might do better; this is the value that was actually
+/// verified to help, not a theoretical optimum.
+const TRELLIS_LAMBDA_MULTIPLIER: f64 = 4.0;
+
+/// `lambda` for `trellis_quantize_block`: see `TRELLIS_LAMBDA_MULTIPLIER`.
+fn trellis_lambda(segment: &Segment) -> f64 {
+    mode_decision_lambda(segment) * TRELLIS_LAMBDA_MULTIPLIER
+}
+
 /// `prob_skip_false` (9.10/19.2 in the spec) is the probability, scaled to a
 /// byte, that a macroblock's `coeffs_skipped` flag is *false* - i.e. that it
 /// is NOT skipped. It only affects how many bits the flag itself costs, not
@@ -266,7 +308,7 @@ fn skip_probability(skipped: u32, total: u32) -> u8 {
 // signalling cost.
 
 /// One coefficient-token coding event within a block, as produced by
-/// [`tokenize_block`]: which `(band, context)` bucket of
+/// [`events_from_quantized`]: which `(band, context)` bucket of
 /// `token_probs[plane]` it reads probabilities from, the DCT token coded (a
 /// `DCT_*` constant, or `DCT_EOB`), and the token tree's start index. That
 /// index is `2` right after a zero coefficient (two zeros in a row can never
@@ -284,82 +326,87 @@ struct TokenEvent {
     quantized_value: i32,
 }
 
-/// Quantizes, zigzags, and walks one block's coefficients, returning the
-/// sequence of token-tree coding events (see `TokenEvent`) plus whether the
-/// block has any non-zero coefficient (the `has_coeffs` complexity-context
-/// bookkeeping `encode_residual_data` threads between blocks).
+/// Classifies a quantized coefficient's absolute value into the DCT token
+/// that codes it (9.6): `DCT_0` for zero, a literal token for 1..=4, or one
+/// of the `DCT_CAT*` category tokens for anything larger. Shared by trellis
+/// quantization (`trellis_quantize_block`, which needs this to price a
+/// candidate level before choosing it) and event emission
+/// (`events_from_quantized`), so the two can never classify the same level
+/// differently.
+fn dct_token_for_level(abs_level: i32) -> i8 {
+    match abs_level {
+        0 => DCT_0,
+        literal @ 1..=4 => literal as i8,
+        5..=6 => DCT_CAT1,
+        7..=10 => DCT_CAT2,
+        11..=18 => DCT_CAT3,
+        19..=34 => DCT_CAT4,
+        35..=66 => DCT_CAT5,
+        _ => DCT_CAT6,
+    }
+}
+
+/// Walks already-quantized, zigzag-order coefficients and builds the
+/// sequence of token-tree coding events (see `TokenEvent`) for them, plus
+/// whether the block has any actual non-zero coefficient (the `has_coeffs`
+/// complexity-context bookkeeping threaded between blocks).
 ///
-/// Pulled out of `encode_coefficients` so the real encode path and the
-/// token-probability statistics dry run (`Vp8Encoder::collect_token_counts`)
-/// tokenize every block identically - two independent copies of this logic
-/// could silently drift apart, which would desync the probabilities the
-/// header advertises from what the residual partitions actually use.
-fn tokenize_block(
-    block: &[i32; 16],
+/// This is the emission half of what used to be a single `tokenize_block`
+/// function that also chose `zigzag_block`/`end_of_block_index` by plain
+/// scalar division. That quantization decision is now made by
+/// `trellis_quantize_block`, which needs this exact walk - context,
+/// `skip_eob`, band - to price every candidate level's real bit cost
+/// *before* picking one, so quantizing and tokenizing can no longer happen
+/// as two independent passes over the same data: whatever
+/// `trellis_quantize_block` decides is final, and this only replays it into
+/// events (for real bit emission, `Vp8Encoder::emit_residual_events`, or for
+/// the token-probability statistics dry run,
+/// `Vp8Encoder::collect_token_counts`).
+///
+/// `has_coeffs` is computed by scanning `zigzag_block` for a non-zero entry,
+/// not by comparing `end_of_block_index` to `first_coeff`. Under plain
+/// scalar quantization those were always equivalent, because
+/// `end_of_block_index` was itself derived from "where's the last non-zero
+/// coefficient". Trellis breaks that equivalence: in a probability bucket
+/// where an explicit zero token happens to cost fewer bits than the
+/// end-of-block token, the search can rationally code one or more explicit
+/// zeros before an eventual, still-optimal end-of-block (see
+/// `trellis_quantize_block`'s "stop" option), which would make the
+/// `end_of_block_index`-based shortcut report `has_coeffs = true` for a
+/// block with no non-zero coefficient at all. The decoder's own
+/// complexity-context bookkeeping is driven by what it actually decodes, so
+/// the encoder has to match that exactly - a mismatch here would desync the
+/// context used for later blocks from what the decoder computes, while
+/// still producing a technically-decodable (but wrongly-decoded-context,
+/// silently-corrupt) bitstream.
+fn events_from_quantized(
+    zigzag_block: &[i32; 16],
+    end_of_block_index: usize,
     plane: Plane,
-    complexity: usize,
-    dc_quant: i16,
-    ac_quant: i16,
+    initial_context: usize,
 ) -> (Vec<TokenEvent>, bool) {
     let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
 
-    assert!(complexity <= 2);
-    let mut complexity = complexity;
-
-    // convert to zigzag and quantize
-    // this is the only lossy part of the encoding
-    let mut zigzag_block = [0i32; 16];
-    for i in first_coeff..16 {
-        let zigzag_index = usize::from(ZIGZAG[i]);
-        let quant = if zigzag_index > 0 { ac_quant } else { dc_quant };
-        zigzag_block[i] = block[zigzag_index] / i32::from(quant);
-    }
-
-    // get index of last coefficient that isn't 0
-    let end_of_block_index =
-        if let Some(last_non_zero_index) = zigzag_block.iter().rev().position(|x| *x != 0) {
-            (15 - last_non_zero_index) + 1
-        } else {
-            // if it's all 0s then the first block is end of block
-            0
-        };
+    assert!(initial_context <= 2);
+    let mut complexity = initial_context;
 
     let mut events = Vec::new();
     let mut skip_eob = false;
+    let mut has_coeffs = false;
 
     for index in first_coeff..end_of_block_index {
         let coeff = zigzag_block[index];
+        if coeff != 0 {
+            has_coeffs = true;
+        }
 
         let band = usize::from(COEFF_BANDS[index]);
         let start_index = if skip_eob { 2 } else { 0 };
 
-        let token = match coeff.abs() {
-            0 => {
-                // never going to have an end of block after a 0, so skip checking next coeff
-                skip_eob = true;
-                DCT_0
-            }
-
-            // just encode as literal
-            literal @ 1..=4 => {
-                skip_eob = false;
-                literal as i8
-            }
-
-            // encode the category
-            value => {
-                skip_eob = false;
-                match value {
-                    5..=6 => DCT_CAT1,
-                    7..=10 => DCT_CAT2,
-                    11..=18 => DCT_CAT3,
-                    19..=34 => DCT_CAT4,
-                    35..=66 => DCT_CAT5,
-                    67..=2048 => DCT_CAT6,
-                    _ => unreachable!(),
-                }
-            }
-        };
+        let token = dct_token_for_level(coeff.abs());
+        // never going to have an end of block right after a 0, so skip
+        // checking next coeff's start index
+        skip_eob = token == DCT_0;
 
         events.push(TokenEvent {
             band,
@@ -389,7 +436,7 @@ fn tokenize_block(
         });
     }
 
-    (events, end_of_block_index > 0)
+    (events, has_coeffs)
 }
 
 /// Per-`(plane, band, context)` bucket branch counts for every internal node
@@ -401,15 +448,17 @@ fn tokenize_block(
 /// `derive_updated_token_probs`.
 type TokenCounts = [[[[[u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
 
-/// Adds one block's tokenization (see `tokenize_block`) into `counts`, by
-/// replaying the exact same root-to-leaf tree walk
+/// Adds one macroblock's worth of already-tagged token events (see
+/// `TokenEvent`, and the `(Plane, TokenEvent)` shape `transform_luma_block`
+/// / `transform_luma_blocks_4x4` / `transform_chroma_blocks` return) into
+/// `counts`, by replaying the exact same root-to-leaf tree walk
 /// `write_with_tree_start_index` performs when actually writing a token
 /// (`tree_encode_path`) and counting each branch instead of encoding it.
-fn accumulate_token_events(counts: &mut TokenCounts, plane: Plane, events: &[TokenEvent]) {
-    for event in events {
+fn accumulate_tagged_events(counts: &mut TokenCounts, events: &[(Plane, TokenEvent)]) {
+    for (plane, event) in events {
         for (bit, prob_index) in tree_encode_path(&DCT_TOKEN_TREE, event.token, event.start_index)
         {
-            counts[plane as usize][event.band][event.context][prob_index][usize::from(bit)] += 1;
+            counts[*plane as usize][event.band][event.context][prob_index][usize::from(bit)] += 1;
         }
     }
 }
@@ -517,6 +566,343 @@ fn derive_updated_token_probs(counts: &TokenCounts) -> TokenProbTables {
     }
 
     probs
+}
+
+// --- Trellis (rate-distortion optimised) quantization -----------------------
+//
+// Scalar quantization (the old `tokenize_block`'s `block[i] / quant`) rounds
+// each coefficient independently, toward zero, with no regard for what it
+// costs to *encode* that choice. Trellis quantization instead searches, per
+// block, over which level to send at every zigzag position - including the
+// position at which to stop the block early (end-of-block) - to minimise a
+// Lagrangian `distortion + lambda * rate` over the whole block at once. This
+// is genuinely a dynamic program over `(position, context)`, not a
+// per-coefficient threshold: a coefficient's token cost depends on the
+// *previous* token's magnitude class (0, 1, or >1 - `TokenEvent::context`)
+// and the current band, so the context a later position is priced under
+// depends on what was chosen at every earlier position, and the DP has to
+// account for that when deciding what's optimal now. `trellis_quantize_
+// block` below is that DP; `CandidateSet` is the per-position candidate
+// levels it chooses among.
+//
+// Distortion is measured as squared error between the dequantized candidate
+// and the *original* transform coefficient, not in the pixel domain. This is
+// legitimate because `transform::dct4x4`/`wht4x4` (like any DCT/Hadamard
+// transform) are orthogonal up to a fixed scale factor: writing the forward
+// transform as a matrix `T`, `T^T T = c * I` for some constant `c` shared by
+// every coefficient. For an error `deltaX` introduced in the coefficient
+// domain, the resulting pixel-domain error after `idct4x4`/`iwht4x4` is
+// `T^-1 deltaX = (T^T / c) deltaX`, whose squared norm is `(1/c) *
+// ||deltaX||^2` - i.e. transform-domain SSE is pixel-domain SSE scaled by a
+// single constant, so ranking candidates by transform-domain SSE ranks them
+// identically to ranking by pixel-domain SSE. `lambda` is `mode_decision_
+// lambda`'s value (so this search and mode decision are choosing points on
+// the same underlying rate/distortion curve for the same image) times
+// `TRELLIS_LAMBDA_MULTIPLIER`, a correction for the two ways this search's
+// units differ from what `mode_decision_lambda` was calibrated for - real
+// bits instead of `coeff_rate_estimate`'s cheap proxy, and transform-domain
+// instead of pixel-domain distortion; see `trellis_lambda` and
+// `TRELLIS_LAMBDA_MULTIPLIER`'s doc comment for both, and the measurements
+// behind the constant's actual value.
+
+/// The candidate levels trellis considers at one zigzag position: the plain
+/// scalar-quantised level (truncating division, same as the old scalar-only
+/// path), that level moved one step toward zero, and zero - deduplicated.
+/// This is the minimum candidate set the search is required to use; a wider
+/// set (e.g. also trying one step *away* from zero, toward round-to-nearest)
+/// could find marginally better roundings in some blocks but isn't
+/// implemented here. A fixed-size array rather than a `Vec`, since this is
+/// built for every position of every block trellis-quantizes and a heap
+/// allocation there would be wasteful.
+#[derive(Clone, Copy)]
+struct CandidateSet {
+    levels: [i32; 3],
+    count: usize,
+}
+
+impl CandidateSet {
+    const EMPTY: CandidateSet = CandidateSet {
+        levels: [0; 3],
+        count: 0,
+    };
+
+    fn new(scalar_level: i32) -> Self {
+        let toward_zero = scalar_level - scalar_level.signum();
+        let mut set = CandidateSet::EMPTY;
+        for &level in &[scalar_level, toward_zero, 0] {
+            if !set.levels[..set.count].contains(&level) {
+                set.levels[set.count] = level;
+                set.count += 1;
+            }
+        }
+        set
+    }
+
+    fn as_slice(&self) -> &[i32] {
+        &self.levels[..self.count]
+    }
+}
+
+/// Real entropy cost, in bits, of one candidate token - the tree-traversal
+/// cost (`tree_encode_path`, the same walk `write_with_tree_start_index`
+/// performs when actually writing a token, priced via `branch_bit_cost`)
+/// plus, for a category token, its "extra" magnitude bits and the sign bit.
+/// Both of those are coded with fixed, non-adapted probabilities
+/// (`PROB_DCT_CAT`, and a flat `128` for the sign - matching `write_flag`),
+/// exactly mirroring what `emit_residual_events` actually writes for a
+/// nonzero token. Used by `trellis_quantize_block` to price a candidate
+/// level without writing it.
+fn coeff_token_bit_cost(
+    token_probs: &[Prob; NUM_DCT_TOKENS - 1],
+    token: i8,
+    start_index: usize,
+    quantized_value: i32,
+) -> f64 {
+    let mut bits = 0.0;
+    for (bit, prob_index) in tree_encode_path(&DCT_TOKEN_TREE, token, start_index) {
+        bits += branch_bit_cost(token_probs[prob_index], bit);
+    }
+
+    if token == DCT_EOB || token == DCT_0 {
+        return bits;
+    }
+
+    if token >= DCT_CAT1 {
+        let category = token;
+        let category_probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
+        let value = quantized_value.abs();
+        let extra = value - i32::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]);
+
+        let mut mask = if category == DCT_CAT6 {
+            1 << (11 - 1)
+        } else {
+            1 << (category - DCT_CAT1)
+        };
+
+        for &prob in category_probs.iter() {
+            if prob == 0 {
+                break;
+            }
+            let extra_bool = extra & mask > 0;
+            bits += branch_bit_cost(prob, extra_bool);
+            mask >>= 1;
+        }
+    }
+
+    // sign bit: fixed probability 128, matching `write_flag`.
+    bits += branch_bit_cost(128, quantized_value.is_negative());
+
+    bits
+}
+
+/// A trellis DP decision at one `(position, context)` state: either place
+/// the end-of-block here (nothing at this position or later is coded), or
+/// code `level` here and continue to the next position.
+#[derive(Clone, Copy)]
+enum TrellisChoice {
+    Stop,
+    Level(i32),
+}
+
+/// Rate-distortion optimised ("trellis") quantization of one block, in
+/// place of plain scalar rounding. See the module doc comment above for the
+/// Lagrangian, the candidate set, and the orthogonality argument for scoring
+/// distortion in the transform domain.
+///
+/// `natural_block` holds the raw (unquantized) transform coefficients in
+/// natural (raster) order, exactly as `transform::dct4x4`/`wht4x4` produce
+/// them - the same input `tokenize_block` used to take. `initial_context` is
+/// the `(0/1/2)` context this block's *first* coded position enters with,
+/// i.e. `left_complexity + top_complexity` from the neighbouring blocks,
+/// same convention as the old scalar path.
+///
+/// Returns the chosen coefficients in natural order, ready to dequantize and
+/// inverse-transform for reconstruction (multiply by `dc_quant`/`ac_quant`
+/// and run `idct4x4`/`iwht4x4`, exactly like the old scalar path did); the
+/// token-coding events for those coefficients (see `TokenEvent`), built in
+/// the same pass since the winning path's bit costs are already known - no
+/// separate re-tokenization is needed, and (per `events_from_quantized`'s
+/// doc comment) re-deriving `has_coeffs` independently would risk getting it
+/// wrong; and whether the block has any actual non-zero coefficient.
+fn trellis_quantize_block(
+    natural_block: &[i32; 16],
+    plane: Plane,
+    initial_context: usize,
+    dc_quant: i16,
+    ac_quant: i16,
+    token_probs_plane: &[[[Prob; NUM_DCT_TOKENS - 1]; 3]; 8],
+    lambda: f64,
+) -> ([i32; 16], Vec<TokenEvent>, bool) {
+    let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
+    assert!(initial_context <= 2);
+
+    // Zigzag-order the raw coefficients: the token tree's band/context
+    // structure (and so its real bit cost) is defined over zigzag
+    // (frequency) order, not the DCT's natural raster order.
+    let mut raw = [0i64; 16];
+    for i in first_coeff..16 {
+        raw[i] = i64::from(natural_block[usize::from(ZIGZAG[i])]);
+    }
+
+    let quant_step = |i: usize| -> i64 {
+        if i == 0 {
+            i64::from(dc_quant)
+        } else {
+            i64::from(ac_quant)
+        }
+    };
+
+    // Suffix sum of squared raw coefficients: the transform-domain
+    // distortion of implicitly zeroing every position from `i` to 15 - what
+    // ending the block at `i` (an explicit end-of-block, or simply running
+    // off the end at 16) costs, since a dequantized zero coefficient is
+    // exactly 0.
+    let mut suffix_distortion = [0i64; 17];
+    for i in (first_coeff..16).rev() {
+        suffix_distortion[i] = suffix_distortion[i + 1] + raw[i] * raw[i];
+    }
+
+    let candidates: [CandidateSet; 16] = std::array::from_fn(|i| {
+        if i < first_coeff {
+            CandidateSet::EMPTY
+        } else {
+            let scalar_level = (raw[i] / quant_step(i)) as i32;
+            CandidateSet::new(scalar_level)
+        }
+    });
+
+    // Backward DP: `dp[i][ctx]` is the minimal `distortion + lambda * rate`
+    // of positions `i..16`, given position `i` is entered with token-tree
+    // context `ctx` - the previous token's magnitude class. `dp[16][_] =
+    // 0.0`: reaching position 16 needs no further coding at all (matches
+    // `events_from_quantized`'s `end_of_block_index < 16` check - the
+    // decoder infers the rest of the block is zero without any token).
+    //
+    // The cost of choosing a candidate at position `i` includes `dp[i +
+    // 1][context after that candidate]`, so what's optimal here depends on
+    // what it makes possible afterwards, and vice versa - a real dynamic
+    // program over `(position, context)`, not sixteen independent
+    // thresholding decisions.
+    let mut dp = [[0.0f64; 3]; 17];
+    let mut choice = [[TrellisChoice::Stop; 3]; 17];
+
+    for i in (first_coeff + 1..16).rev() {
+        let band = usize::from(COEFF_BANDS[i]);
+        for ctx in 0..3usize {
+            // After a zero token, `write_with_tree_start_index` starts the
+            // *next* token's tree walk at index 2 (`skip_eob`), which skips
+            // the branch that would encode "end of block here" - the
+            // format simply disallows placing an explicit end-of-block
+            // right after an explicit zero (it would always have been one
+            // token cheaper to just stop at the zero's position instead).
+            // So "stop here" is only a legal choice when `ctx != 0`.
+            let start_index = if ctx == 0 { 2 } else { 0 };
+            let probs = &token_probs_plane[band][ctx];
+
+            let mut best_cost = f64::INFINITY;
+            let mut best_choice = TrellisChoice::Stop;
+
+            if start_index == 0 {
+                let eob_bits = coeff_token_bit_cost(probs, DCT_EOB, start_index, 0);
+                best_cost = lambda * eob_bits + suffix_distortion[i] as f64;
+                best_choice = TrellisChoice::Stop;
+            }
+
+            for &level in candidates[i].as_slice() {
+                let token = dct_token_for_level(level.abs());
+                let bits = coeff_token_bit_cost(probs, token, start_index, level);
+                let diff = i64::from(level) * quant_step(i) - raw[i];
+                let distortion = (diff * diff) as f64;
+                let next_ctx = match token {
+                    DCT_0 => 0,
+                    DCT_1 => 1,
+                    _ => 2,
+                };
+                let cost = distortion + lambda * bits + dp[i + 1][next_ctx];
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_choice = TrellisChoice::Level(level);
+                }
+            }
+
+            dp[i][ctx] = best_cost;
+            choice[i][ctx] = best_choice;
+        }
+    }
+
+    // The block's first coded position is special: a block's first token
+    // always starts its tree walk at index 0, regardless of
+    // `initial_context` - that context comes from neighbouring blocks' last
+    // token, not from anything coded so far *in this block* - matching the
+    // old scalar path's `skip_eob = false` initial value. So this can't
+    // reuse the `ctx == 0 => start_index = 2` rule the backward pass above
+    // uses for every later position.
+    let band0 = usize::from(COEFF_BANDS[first_coeff]);
+    let probs0 = &token_probs_plane[band0][initial_context];
+
+    let mut best_cost = lambda * coeff_token_bit_cost(probs0, DCT_EOB, 0, 0)
+        + suffix_distortion[first_coeff] as f64;
+    let mut best_choice = TrellisChoice::Stop;
+
+    for &level in candidates[first_coeff].as_slice() {
+        let token = dct_token_for_level(level.abs());
+        let bits = coeff_token_bit_cost(probs0, token, 0, level);
+        let diff = i64::from(level) * quant_step(first_coeff) - raw[first_coeff];
+        let distortion = (diff * diff) as f64;
+        let next_ctx = match token {
+            DCT_0 => 0,
+            DCT_1 => 1,
+            _ => 2,
+        };
+        let cost = distortion + lambda * bits + dp[first_coeff + 1][next_ctx];
+        if cost < best_cost {
+            best_cost = cost;
+            best_choice = TrellisChoice::Level(level);
+        }
+    }
+
+    // Forward backtrack: replay the winning choices to build the zigzag
+    // coefficient array and find where the block actually ends.
+    let mut zigzag = [0i32; 16];
+    let end_of_block_index = match best_choice {
+        TrellisChoice::Stop => first_coeff,
+        TrellisChoice::Level(level) => {
+            zigzag[first_coeff] = level;
+            let mut ctx = match dct_token_for_level(level.abs()) {
+                DCT_0 => 0,
+                DCT_1 => 1,
+                _ => 2,
+            };
+            let mut i = first_coeff + 1;
+            loop {
+                if i == 16 {
+                    break 16;
+                }
+                match choice[i][ctx] {
+                    TrellisChoice::Stop => break i,
+                    TrellisChoice::Level(level) => {
+                        zigzag[i] = level;
+                        ctx = match dct_token_for_level(level.abs()) {
+                            DCT_0 => 0,
+                            DCT_1 => 1,
+                            _ => 2,
+                        };
+                        i += 1;
+                    }
+                }
+            }
+        }
+    };
+
+    let (events, has_coeffs) =
+        events_from_quantized(&zigzag, end_of_block_index, plane, initial_context);
+
+    let mut natural = [0i32; 16];
+    for i in first_coeff..16 {
+        natural[usize::from(ZIGZAG[i])] = zigzag[i];
+    }
+
+    (natural, events, has_coeffs)
 }
 
 struct Vp8Encoder<W> {
@@ -798,154 +1184,30 @@ impl<W: Write> Vp8Encoder<W> {
         );
     }
 
-    // 13 in specification, matches read_residual_data in the decoder
-    fn encode_residual_data(
-        &mut self,
-        macroblock_info: &MacroblockInfo,
-        partition_index: usize,
-        mbx: usize,
-        y_block_data: &[i32; 16 * 16],
-        u_block_data: &[i32; 16 * 4],
-        v_block_data: &[i32; 16 * 4],
-    ) {
-        let mut plane = if macroblock_info.luma_mode == LumaMode::B {
-            Plane::YCoeff0
-        } else {
-            Plane::Y2
-        };
-
-        // TODO: change to get index from macroblock
-        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
-
-        // Y2
-        if plane == Plane::Y2 {
-            // encode 0th coefficient of each luma
-            let mut coeffs0 = get_coeffs0_from_block(y_block_data);
-
-            // wht here on the 0th coeffs
-            transform::wht4x4(&mut coeffs0);
-
-            let complexity = self.left_complexity.y2 + self.top_complexity[mbx].y2;
-
-            let has_coeffs = self.encode_coefficients(
-                &coeffs0,
-                partition_index,
-                plane,
-                complexity.into(),
-                segment.y2dc,
-                segment.y2ac,
-            );
-
-            self.left_complexity.y2 = if has_coeffs { 1 } else { 0 };
-            self.top_complexity[mbx].y2 = if has_coeffs { 1 } else { 0 };
-
-            // next encode luma coefficients without the 0th coeffs
-            plane = Plane::YCoeff1;
-        }
-
-        // now encode the 16 luma 4x4 subblocks in the macroblock
-        for y in 0usize..4 {
-            let mut left = self.left_complexity.y[y];
-            for x in 0..4 {
-                let block = y_block_data[y * 4 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].y[x];
-                let complexity = left + top;
-
-                let has_coeffs = self.encode_coefficients(
-                    &block,
-                    partition_index,
-                    plane,
-                    complexity.into(),
-                    segment.ydc,
-                    segment.yac,
-                );
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].y[x] = if has_coeffs { 1 } else { 0 };
-            }
-            // set for the next macroblock
-            self.left_complexity.y[y] = left;
-        }
-
-        plane = Plane::Chroma;
-
-        // encode the 4 u 4x4 subblocks
-        for y in 0usize..2 {
-            let mut left = self.left_complexity.u[y];
-            for x in 0usize..2 {
-                let block = u_block_data[y * 2 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].u[x];
-                let complexity = left + top;
-
-                let has_coeffs = self.encode_coefficients(
-                    &block,
-                    partition_index,
-                    plane,
-                    complexity.into(),
-                    segment.uvdc,
-                    segment.uvac,
-                );
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].u[x] = if has_coeffs { 1 } else { 0 };
-            }
-            self.left_complexity.u[y] = left;
-        }
-
-        // encode the 4 v 4x4 subblocks
-        for y in 0usize..2 {
-            let mut left = self.left_complexity.v[y];
-            for x in 0usize..2 {
-                let block = v_block_data[y * 2 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].v[x];
-                let complexity = left + top;
-
-                let has_coeffs = self.encode_coefficients(
-                    &block,
-                    partition_index,
-                    plane,
-                    complexity.into(),
-                    segment.uvdc,
-                    segment.uvac,
-                );
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].v[x] = if has_coeffs { 1 } else { 0 };
-            }
-            self.left_complexity.v[y] = left;
-        }
-    }
-
-    // encodes the coefficients which is the reverse procedure of read_coefficients in the decoder
-    // returns whether there was any non-zero data in the block for the complexity
-    fn encode_coefficients(
-        &mut self,
-        block: &[i32; 16],
-        partition_index: usize,
-        plane: Plane,
-        complexity: usize,
-        dc_quant: i16,
-        ac_quant: i16,
-    ) -> bool {
-        let (events, has_coeffs) = tokenize_block(block, plane, complexity, dc_quant, ac_quant);
-
+    // 13 in specification, matches read_residual_data in the decoder.
+    //
+    // Unlike the old `encode_residual_data`, this does no quantization or
+    // tokenization itself - it only writes bits for events already produced
+    // by `trellis_quantize_block` (inside `transform_luma_block` /
+    // `transform_luma_blocks_4x4` / `transform_chroma_blocks`, which run
+    // before this is called). Trellis has to know a token's real bit cost
+    // *before* choosing it, so the quantizing decision and the tokenizing
+    // are made together, well before the bits are actually written; this
+    // only replays that decision. `events` must be in encode order (Y2,
+    // then the 16 luma sub-blocks, then all of U, then all of V) - exactly
+    // what those three methods build them in.
+    fn emit_residual_events(&mut self, partition_index: usize, events: &[(Plane, TokenEvent)]) {
+        // `self.token_probs` is `Copy`; taking a local copy here avoids
+        // borrowing `self` both immutably (for the probabilities) and
+        // mutably (for `self.partitions[partition_index]`) at once.
+        let token_probs = self.token_probs;
         let encoder = &mut self.partitions[partition_index];
-        let probs = &self.token_probs[plane as usize];
 
-        for event in &events {
-            let token_probs = &probs[event.band][event.context];
+        for (plane, event) in events {
+            let probs = &token_probs[*plane as usize][event.band][event.context];
             encoder.write_with_tree_start_index(
                 &DCT_TOKEN_TREE,
-                token_probs,
+                probs,
                 event.token,
                 event.start_index,
             );
@@ -982,9 +1244,6 @@ impl<W: Write> Vp8Encoder<W> {
             // note flag means coeff is negative
             encoder.write_flag(!event.quantized_value.is_positive());
         }
-
-        // whether the block has a non zero coefficient
-        has_coeffs
     }
 
     fn encode_image(
@@ -1031,10 +1290,17 @@ impl<W: Write> Vp8Encoder<W> {
         // `encode_compressed_frame_header` (below) has to advertise them
         // before any residual data is written, so learn the real per-bucket
         // token statistics with one more dry run and derive the frame's
-        // `token_probs` from them now. `encode_coefficients` reads
+        // `token_probs` from them now. `emit_residual_events` reads
         // `self.token_probs` directly, so setting it here is what makes the
         // real pass below use exactly what the header just advertised - see
-        // `derive_updated_token_probs` for the update decision itself.
+        // `derive_updated_token_probs` for the update decision itself. It's
+        // also what `trellis_quantize_block` prices candidates against in
+        // the real pass below, though not in this dry run or the skip-rate
+        // one above - both of those still run before `token_probs` is
+        // known, so their trellis decisions are made (and then thrown away)
+        // against the `COEFF_PROBS` default. That's a known, small
+        // bootstrapping approximation: this dry run's job is to *learn*
+        // `token_probs`, so it can't yet know the value it's computing.
         let token_counts = self.collect_token_counts();
         self.reset_frame_state();
         self.token_probs = derive_updated_token_probs(&token_counts);
@@ -1042,6 +1308,7 @@ impl<W: Write> Vp8Encoder<W> {
         self.encode_compressed_frame_header();
 
         // encode residual partitions first
+        let mut events: Vec<(Plane, TokenEvent)> = Vec::new();
         for mby in 0..self.macroblock_height {
             let partition_index = usize::from(mby) % self.partitions.len();
             // reset left complexity / bpreds for left of image
@@ -1067,31 +1334,29 @@ impl<W: Write> Vp8Encoder<W> {
                 // calls `intra_predict_luma`/`intra_predict_chroma`, just with
                 // an all-zero coefficient block when `coeffs_skipped`). Only
                 // the bit-writing below is conditional.
-                let y_block_data =
-                    self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info);
-
-                let (u_block_data, v_block_data) = self.transform_chroma_blocks(
+                //
+                // These two also run trellis quantization (`trellis_
+                // quantize_block`) and update `self.left_complexity` /
+                // `self.top_complexity` themselves as they go, since with
+                // trellis the quantized levels depend on that running
+                // context - unlike the old scalar-only path, it can no
+                // longer be recomputed independently afterwards. Whenever a
+                // macroblock's mode-decision trial found every coefficient
+                // to be zero (`coeffs_skipped`), trellis - whose candidate
+                // set at a position whose scalar level is 0 is just `{0}` -
+                // is forced to reproduce that same all-zero result here, so
+                // there's nothing left to separately "clear".
+                events.clear();
+                self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info, &mut events);
+                self.transform_chroma_blocks(
                     mbx.into(),
                     mby.into(),
                     macroblock_info.chroma_mode,
+                    &mut events,
                 );
 
                 if !macroblock_info.coeffs_skipped {
-                    self.encode_residual_data(
-                        &macroblock_info,
-                        partition_index,
-                        mbx as usize,
-                        &y_block_data,
-                        &u_block_data,
-                        &v_block_data,
-                    );
-                } else {
-                    // since coeffs are all zero, need to set all complexities to 0
-                    // except if the luma mode is B then won't set Y2
-                    self.left_complexity
-                        .clear(macroblock_info.luma_mode != LumaMode::B);
-                    self.top_complexity[usize::from(mbx)]
-                        .clear(macroblock_info.luma_mode != LumaMode::B);
+                    self.emit_residual_events(partition_index, &events);
                 }
             }
         }
@@ -1590,6 +1855,7 @@ impl<W: Write> Vp8Encoder<W> {
     fn count_skipped_macroblocks(&mut self) -> (u32, u32) {
         let mut total = 0u32;
         let mut skipped = 0u32;
+        let mut events: Vec<(Plane, TokenEvent)> = Vec::new();
 
         for mby in 0..self.macroblock_height {
             self.left_complexity = Complexity::default();
@@ -1600,8 +1866,17 @@ impl<W: Write> Vp8Encoder<W> {
 
             for mbx in 0..self.macroblock_width {
                 let info = self.choose_macroblock_info(mbx.into(), mby.into());
-                self.transform_luma_block(mbx.into(), mby.into(), &info);
-                self.transform_chroma_blocks(mbx.into(), mby.into(), info.chroma_mode);
+
+                // `transform_luma_block` / `transform_chroma_blocks` also
+                // run trellis quantization and thread real complexity
+                // context now (see `encode_image`'s equivalent comment);
+                // `events` is discarded here, same as the old scalar-only
+                // path discarded its return values - this dry run only
+                // needs `info.coeffs_skipped`, which mode decision already
+                // determined.
+                events.clear();
+                self.transform_luma_block(mbx.into(), mby.into(), &info, &mut events);
+                self.transform_chroma_blocks(mbx.into(), mby.into(), info.chroma_mode, &mut events);
 
                 total += 1;
                 if info.coeffs_skipped {
@@ -1620,18 +1895,20 @@ impl<W: Write> Vp8Encoder<W> {
     /// coefficient probability updates.
     ///
     /// Same two-pass shape as `count_skipped_macroblocks` just above, and for
-    /// the same reason: mode decision and reconstruction only depend on
-    /// pixel data and border state, never on entropy-coding probabilities
-    /// (see that method's doc comment), so this can run mode decision for
-    /// real, tokenize every block's actual coefficients
-    /// (`accumulate_residual_token_counts` / `tokenize_block`), and still be
-    /// guaranteed to count exactly the tokens the real encode pass will
-    /// later emit - before the header that has to carry the result is
-    /// written. The border/b_pred/complexity state this mutates is fully
-    /// reset by `reset_frame_state` immediately afterwards, same as after
+    /// the same reason: mode decision only depends on pixel data and border
+    /// state, never on entropy-coding probabilities (see that method's doc
+    /// comment), so this can run mode decision for real and accumulate every
+    /// block's actual trellis-chosen tokens (`accumulate_tagged_events`).
+    /// Trellis quantization itself *does* depend on entropy-coding
+    /// probabilities (that's the whole point), but by the time this runs
+    /// `self.token_probs` is still the `COEFF_PROBS` default - see
+    /// `encode_image`'s comment on that bootstrapping approximation. The
+    /// border/b_pred/complexity state this mutates is fully reset by
+    /// `reset_frame_state` immediately afterwards, same as after
     /// `count_skipped_macroblocks`.
     fn collect_token_counts(&mut self) -> TokenCounts {
         let mut counts: TokenCounts = [[[[[0u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
+        let mut events: Vec<(Plane, TokenEvent)> = Vec::new();
 
         for mby in 0..self.macroblock_height {
             self.left_complexity = Complexity::default();
@@ -1645,139 +1922,25 @@ impl<W: Write> Vp8Encoder<W> {
                 let mby = usize::from(mby);
                 let info = self.choose_macroblock_info(mbx, mby);
 
-                let y_block_data = self.transform_luma_block(mbx, mby, &info);
-                let (u_block_data, v_block_data) =
-                    self.transform_chroma_blocks(mbx, mby, info.chroma_mode);
+                events.clear();
+                self.transform_luma_block(mbx, mby, &info, &mut events);
+                self.transform_chroma_blocks(mbx, mby, info.chroma_mode, &mut events);
 
                 if info.coeffs_skipped {
                     // matches `encode_image`'s handling of a skipped
                     // macroblock: no residual data (and so no tokens) is
-                    // ever coded for it, but the complexity context it
-                    // leaves for its neighbours is still all-zero.
-                    self.left_complexity.clear(info.luma_mode != LumaMode::B);
-                    self.top_complexity[mbx].clear(info.luma_mode != LumaMode::B);
+                    // ever coded for it. The complexity context it leaves
+                    // for its neighbours is already all-zero, via the same
+                    // reasoning as `count_skipped_macroblocks` - no separate
+                    // clearing needed.
                     continue;
                 }
 
-                self.accumulate_residual_token_counts(
-                    &info,
-                    mbx,
-                    &y_block_data,
-                    &u_block_data,
-                    &v_block_data,
-                    &mut counts,
-                );
+                accumulate_tagged_events(&mut counts, &events);
             }
         }
 
         counts
-    }
-
-    /// Tokenizes and counts one non-skipped macroblock's residual data into
-    /// `counts` - the statistics-only counterpart of `encode_residual_data`,
-    /// which this mirrors block for block (Y2, then the 16 luma sub-blocks,
-    /// then chroma), including its left/top complexity-context threading,
-    /// so the `(band, context)` bucket each token is counted into is exactly
-    /// the one `encode_coefficients` will use for that same coefficient in
-    /// the real pass.
-    fn accumulate_residual_token_counts(
-        &mut self,
-        macroblock_info: &MacroblockInfo,
-        mbx: usize,
-        y_block_data: &[i32; 16 * 16],
-        u_block_data: &[i32; 16 * 4],
-        v_block_data: &[i32; 16 * 4],
-        counts: &mut TokenCounts,
-    ) {
-        let mut plane = if macroblock_info.luma_mode == LumaMode::B {
-            Plane::YCoeff0
-        } else {
-            Plane::Y2
-        };
-
-        let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
-
-        if plane == Plane::Y2 {
-            let mut coeffs0 = get_coeffs0_from_block(y_block_data);
-            transform::wht4x4(&mut coeffs0);
-
-            let complexity = self.left_complexity.y2 + self.top_complexity[mbx].y2;
-            let (events, has_coeffs) = tokenize_block(
-                &coeffs0,
-                Plane::Y2,
-                complexity.into(),
-                segment.y2dc,
-                segment.y2ac,
-            );
-            accumulate_token_events(counts, Plane::Y2, &events);
-
-            self.left_complexity.y2 = if has_coeffs { 1 } else { 0 };
-            self.top_complexity[mbx].y2 = if has_coeffs { 1 } else { 0 };
-
-            plane = Plane::YCoeff1;
-        }
-
-        for y in 0usize..4 {
-            let mut left = self.left_complexity.y[y];
-            for x in 0..4 {
-                let block = y_block_data[y * 4 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].y[x];
-                let complexity = left + top;
-
-                let (events, has_coeffs) =
-                    tokenize_block(block, plane, complexity.into(), segment.ydc, segment.yac);
-                accumulate_token_events(counts, plane, &events);
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].y[x] = if has_coeffs { 1 } else { 0 };
-            }
-            self.left_complexity.y[y] = left;
-        }
-
-        plane = Plane::Chroma;
-
-        for y in 0usize..2 {
-            let mut left = self.left_complexity.u[y];
-            for x in 0usize..2 {
-                let block = u_block_data[y * 2 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].u[x];
-                let complexity = left + top;
-
-                let (events, has_coeffs) =
-                    tokenize_block(block, plane, complexity.into(), segment.uvdc, segment.uvac);
-                accumulate_token_events(counts, plane, &events);
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].u[x] = if has_coeffs { 1 } else { 0 };
-            }
-            self.left_complexity.u[y] = left;
-        }
-
-        for y in 0usize..2 {
-            let mut left = self.left_complexity.v[y];
-            for x in 0usize..2 {
-                let block = v_block_data[y * 2 * 16 + x * 16..][..16]
-                    .try_into()
-                    .unwrap();
-
-                let top = self.top_complexity[mbx].v[x];
-                let complexity = left + top;
-
-                let (events, has_coeffs) =
-                    tokenize_block(block, plane, complexity.into(), segment.uvdc, segment.uvac);
-                accumulate_token_events(counts, plane, &events);
-
-                left = if has_coeffs { 1 } else { 0 };
-                self.top_complexity[mbx].v[x] = if has_coeffs { 1 } else { 0 };
-            }
-            self.left_complexity.v[y] = left;
-        }
     }
 
     // sets up the encoding of the encoder by setting all the encoder params based on the width and height
@@ -2038,21 +2201,36 @@ impl<W: Write> Vp8Encoder<W> {
     // 1. Does the luma prediction and subtracts from the block
     // 2. Converts the block so each 4x4 subblock is contiguous within the block
     // 3. Does the DCT on each subblock
-    // 4. Quantizes the block and dequantizes each subblock
-    // 5. Calculates the quantized block - this can be used to calculate how accurate the
-    // result is and is used to populate the borders for the next macroblock
+    // 4. Trellis-quantizes the block (`trellis_quantize_block`) and
+    //    dequantizes each subblock
+    // 5. Reconstructs from the dequantized coefficients - this populates the
+    //    borders for the next macroblock, and must use the exact same
+    //    coefficients tokenized into `events` (see `trellis_quantize_
+    //    block`'s doc comment): reconstructing from anything else would
+    //    desync this encoder's own predictions from what the decoder will
+    //    reconstruct from the bits actually written.
+    //
+    // Pushes this macroblock's Y2 and luma token events onto `events`, in
+    // the same Y2-then-16-subblocks order `emit_residual_events` /
+    // `accumulate_tagged_events` expect, and updates `self.left_complexity`
+    // / `self.top_complexity` as it goes (unlike the old scalar-only path,
+    // where that threading happened later, in a separate re-tokenization
+    // pass - trellis needs the real running context available *before* it
+    // can quantize, not after).
     fn transform_luma_block(
         &mut self,
         mbx: usize,
         mby: usize,
         macroblock_info: &MacroblockInfo,
-    ) -> [i32; 16 * 16] {
+        events: &mut Vec<(Plane, TokenEvent)>,
+    ) {
         if macroblock_info.luma_mode == LumaMode::B {
             if let Some(bpred_modes) = macroblock_info.luma_bpred {
-                return self.transform_luma_blocks_4x4(bpred_modes, mbx, mby);
+                self.transform_luma_blocks_4x4(bpred_modes, mbx, mby, events);
             } else {
                 panic!("Invalid, need bpred modes for luma mode B");
             }
+            return;
         }
 
         let mut y_with_border =
@@ -2060,26 +2238,75 @@ impl<W: Write> Vp8Encoder<W> {
         let luma_blocks = self.get_luma_blocks_from_predicted_16x16(&y_with_border, mbx, mby);
 
         let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
+        let lambda = trellis_lambda(&segment);
 
-        // get coeffs
-        let mut coeffs = self.get_luma_block_coeffs_16x16(luma_blocks, &segment);
+        // Y2: the WHT of each of the 16 luma blocks' own DC coefficient
+        // (13.2/14.3 in the spec) - trellis-quantized first, since its
+        // dequantized/inverse-WHT output supplies the DC term every luma
+        // block below reconstructs from. B_PRED has no Y2 block; see
+        // `transform_luma_blocks_4x4`.
+        let mut y2 = get_coeffs0_from_block(&luma_blocks);
+        transform::wht4x4(&mut y2);
 
-        // now we're essentially applying the same functions as the decoder in order to ensure
-        // that the border is the same as the one used for the decoder in the same macroblock
-        let dequantized_blocks = self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs);
+        let y2_context = self.left_complexity.y2 + self.top_complexity[mbx].y2;
+        let (mut y2_dequant, y2_events, y2_has_coeffs) = trellis_quantize_block(
+            &y2,
+            Plane::Y2,
+            y2_context.into(),
+            segment.y2dc,
+            segment.y2ac,
+            &self.token_probs[Plane::Y2 as usize],
+            lambda,
+        );
+        events.extend(y2_events.into_iter().map(|event| (Plane::Y2, event)));
+        self.left_complexity.y2 = if y2_has_coeffs { 1 } else { 0 };
+        self.top_complexity[mbx].y2 = if y2_has_coeffs { 1 } else { 0 };
 
-        // re-use the y_with_border from earlier since the prediction is still valid
-        // applies the same thing as the decoder so that the border will line up
+        for (k, coeff) in y2_dequant.iter_mut().enumerate() {
+            let quant = if k > 0 { segment.y2ac } else { segment.y2dc };
+            *coeff *= i32::from(quant);
+        }
+        transform::iwht4x4(&mut y2_dequant);
+
+        // Now trellis-quantize each of the 16 luma AC blocks - their own DC
+        // (`Plane::YCoeff1`'s `first_coeff == 1`) is skipped, since Y2
+        // already carries it - substitute the inverse-WHT'd Y2 term back in
+        // as each block's DC, and IDCT/reconstruct exactly like the
+        // decoder's own residual reconstruction.
         for y in 0usize..4 {
-            for x in 0usize..4 {
-                let i = x + y * 4;
-                // Create a reference to a [i32; 16] array for add_residue (slices of size 16 do not work).
-                let rb: &[i32; 16] = dequantized_blocks[i * 16..][..16].try_into().unwrap();
+            let mut left = self.left_complexity.y[y];
+            for x in 0..4 {
+                let i = y * 4 + x;
+                let block: &[i32; 16] = luma_blocks[i * 16..][..16].try_into().unwrap();
+
+                let top = self.top_complexity[mbx].y[x];
+                let context = left + top;
+
+                let (mut natural, block_events, has_coeffs) = trellis_quantize_block(
+                    block,
+                    Plane::YCoeff1,
+                    context.into(),
+                    segment.ydc,
+                    segment.yac,
+                    &self.token_probs[Plane::YCoeff1 as usize],
+                    lambda,
+                );
+                events.extend(block_events.into_iter().map(|event| (Plane::YCoeff1, event)));
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].y[x] = if has_coeffs { 1 } else { 0 };
+
+                for v in natural[1..].iter_mut() {
+                    *v *= i32::from(segment.yac);
+                }
+                natural[0] = y2_dequant[i];
+                transform::idct4x4(&mut natural);
+
                 let y0 = 1 + y * 4;
                 let x0 = 1 + x * 4;
-
-                add_residue(&mut y_with_border, rb, y0, x0, LUMA_STRIDE);
+                add_residue(&mut y_with_border, &natural, y0, x0, LUMA_STRIDE);
             }
+            self.left_complexity.y[y] = left;
         }
 
         // set borders from values
@@ -2090,19 +2317,25 @@ impl<W: Write> Vp8Encoder<W> {
         for (x, border_value) in self.top_border_y[mbx * 16..][..16].iter_mut().enumerate() {
             *border_value = y_with_border[16 * LUMA_STRIDE + x + 1];
         }
-
-        luma_blocks
     }
 
     // this is for transforming the luma blocks for each subblock independently
     // meaning the luma mode is B
+    //
+    // Unlike the 16x16 modes, B_PRED's sub-blocks are not independent: each
+    // one predicts from the *reconstructed* pixels of earlier sub-blocks in
+    // the same macroblock (`predict_b*pred` reads the border buffer this
+    // loop just wrote into). So trellis-quantizing and reconstructing a
+    // sub-block has to happen before the next sub-block is predicted, same
+    // requirement `trial_luma_bpred`'s doc comment explains for the RD
+    // search - this is the real-encode counterpart of that.
     fn transform_luma_blocks_4x4(
         &mut self,
         bpred_modes: [IntraMode; 16],
         mbx: usize,
         mby: usize,
-    ) -> [i32; 16 * 16] {
-        let mut luma_blocks = [0i32; 16 * 16];
+        events: &mut Vec<(Plane, TokenEvent)>,
+    ) {
         let stride = 1usize + 16 + 4;
         let mbw = self.macroblock_width;
         let width = usize::from(mbw * 16);
@@ -2116,8 +2349,10 @@ impl<W: Write> Vp8Encoder<W> {
         );
 
         let segment = self.segments[0];
+        let lambda = trellis_lambda(&segment);
 
         for sby in 0usize..4 {
+            let mut left = self.left_complexity.y[sby];
             for sbx in 0usize..4 {
                 let i = sby * 4 + sbx;
                 let y0 = sby * 4 + 1;
@@ -2136,7 +2371,6 @@ impl<W: Write> Vp8Encoder<W> {
                     IntraMode::HU => predict_bhupred(&mut y_with_border, x0, y0, stride),
                 }
 
-                let block_index = sby * 16 * 4 + sbx * 16;
                 let mut current_subblock = [0i32; 16];
 
                 // subtract actual values here
@@ -2155,16 +2389,31 @@ impl<W: Write> Vp8Encoder<W> {
 
                 transform::dct4x4(&mut current_subblock);
 
-                luma_blocks[block_index..][..16].copy_from_slice(&current_subblock);
+                let top = self.top_complexity[mbx].y[sbx];
+                let context = left + top;
 
-                // quantize and de-quantize the subblock
-                for (index, y_value) in current_subblock.iter_mut().enumerate() {
+                let (mut natural, block_events, has_coeffs) = trellis_quantize_block(
+                    &current_subblock,
+                    Plane::YCoeff0,
+                    context.into(),
+                    segment.ydc,
+                    segment.yac,
+                    &self.token_probs[Plane::YCoeff0 as usize],
+                    lambda,
+                );
+                events.extend(block_events.into_iter().map(|event| (Plane::YCoeff0, event)));
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].y[sbx] = if has_coeffs { 1 } else { 0 };
+
+                for (index, v) in natural.iter_mut().enumerate() {
                     let quant = if index > 0 { segment.yac } else { segment.ydc };
-                    *y_value = (*y_value / i32::from(quant)) * i32::from(quant);
+                    *v *= i32::from(quant);
                 }
-                transform::idct4x4(&mut current_subblock);
-                add_residue(&mut y_with_border, &current_subblock, y0, x0, stride);
+                transform::idct4x4(&mut natural);
+                add_residue(&mut y_with_border, &natural, y0, x0, stride);
             }
+            self.left_complexity.y[sby] = left;
         }
 
         // set borders from values
@@ -2175,8 +2424,6 @@ impl<W: Write> Vp8Encoder<W> {
         for (x, border_value) in self.top_border_y[mbx * 16..][..16].iter_mut().enumerate() {
             *border_value = y_with_border[16 * stride + x + 1];
         }
-
-        luma_blocks
     }
 
     fn get_predicted_chroma_block(
@@ -2305,13 +2552,23 @@ impl<W: Write> Vp8Encoder<W> {
         dequantized_blocks
     }
 
+    /// Trellis-quantizes and reconstructs both chroma planes, pushing their
+    /// token events onto `events` - all of U's four sub-blocks, in raster
+    /// order, followed by all of V's (13.3 in the spec: chroma residual data
+    /// is U-plane-then-V-plane, not interleaved - `emit_residual_events` /
+    /// `accumulate_tagged_events` need `events` in exactly that order).
+    /// Updates `self.left_complexity`/`self.top_complexity`'s `u`/`v` fields
+    /// as it goes, same reasoning as `transform_luma_block`.
     fn transform_chroma_blocks(
         &mut self,
         mbx: usize,
         mby: usize,
         chroma_mode: ChromaMode,
-    ) -> ([i32; 16 * 4], [i32; 16 * 4]) {
+        events: &mut Vec<(Plane, TokenEvent)>,
+    ) {
         let stride = CHROMA_STRIDE;
+        let segment = self.segments[0];
+        let lambda = trellis_lambda(&segment);
 
         let mut predicted_u = self.get_predicted_chroma_block(
             chroma_mode,
@@ -2333,25 +2590,70 @@ impl<W: Write> Vp8Encoder<W> {
         let v_blocks =
             self.get_chroma_blocks_from_predicted(&predicted_v, &self.frame.vbuf, mbx, mby);
 
-        let u_coeffs = self.get_chroma_block_coeffs(u_blocks);
-        let v_coeffs = self.get_chroma_block_coeffs(v_blocks);
+        for y in 0usize..2 {
+            let mut left = self.left_complexity.u[y];
+            for x in 0usize..2 {
+                let i = y * 2 + x;
+                let block: &[i32; 16] = u_blocks[i * 16..][..16].try_into().unwrap();
 
-        let quantized_u_residue = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs);
-        let quantized_v_residue = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs);
+                let top = self.top_complexity[mbx].u[x];
+                let context = left + top;
+
+                let (mut natural, block_events, has_coeffs) = trellis_quantize_block(
+                    block,
+                    Plane::Chroma,
+                    context.into(),
+                    segment.uvdc,
+                    segment.uvac,
+                    &self.token_probs[Plane::Chroma as usize],
+                    lambda,
+                );
+                events.extend(block_events.into_iter().map(|event| (Plane::Chroma, event)));
+
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].u[x] = if has_coeffs { 1 } else { 0 };
+
+                for (index, v) in natural.iter_mut().enumerate() {
+                    let quant = if index > 0 { segment.uvac } else { segment.uvdc };
+                    *v *= i32::from(quant);
+                }
+                transform::idct4x4(&mut natural);
+                add_residue(&mut predicted_u, &natural, 1 + y * 4, 1 + x * 4, stride);
+            }
+            self.left_complexity.u[y] = left;
+        }
 
         for y in 0usize..2 {
+            let mut left = self.left_complexity.v[y];
             for x in 0usize..2 {
-                let i = x + y * 2;
-                let urb: &[i32; 16] = quantized_u_residue[i * 16..][..16].try_into().unwrap();
+                let i = y * 2 + x;
+                let block: &[i32; 16] = v_blocks[i * 16..][..16].try_into().unwrap();
 
-                let y0 = 1 + y * 4;
-                let x0 = 1 + x * 4;
-                add_residue(&mut predicted_u, urb, y0, x0, stride);
+                let top = self.top_complexity[mbx].v[x];
+                let context = left + top;
 
-                let vrb: &[i32; 16] = quantized_v_residue[i * 16..][..16].try_into().unwrap();
+                let (mut natural, block_events, has_coeffs) = trellis_quantize_block(
+                    block,
+                    Plane::Chroma,
+                    context.into(),
+                    segment.uvdc,
+                    segment.uvac,
+                    &self.token_probs[Plane::Chroma as usize],
+                    lambda,
+                );
+                events.extend(block_events.into_iter().map(|event| (Plane::Chroma, event)));
 
-                add_residue(&mut predicted_v, vrb, y0, x0, stride);
+                left = if has_coeffs { 1 } else { 0 };
+                self.top_complexity[mbx].v[x] = if has_coeffs { 1 } else { 0 };
+
+                for (index, v) in natural.iter_mut().enumerate() {
+                    let quant = if index > 0 { segment.uvac } else { segment.uvdc };
+                    *v *= i32::from(quant);
+                }
+                transform::idct4x4(&mut natural);
+                add_residue(&mut predicted_v, &natural, 1 + y * 4, 1 + x * 4, stride);
             }
+            self.left_complexity.v[y] = left;
         }
 
         // set borders
@@ -2373,8 +2675,6 @@ impl<W: Write> Vp8Encoder<W> {
             *u_border_value = predicted_u[8 * stride + x + 1];
             *v_border_value = predicted_v[8 * stride + x + 1];
         }
-
-        (u_blocks, v_blocks)
     }
 }
 
@@ -2406,4 +2706,191 @@ pub(crate) fn encode_frame_lossy<W: Write>(
     vp8_encoder.encode_image(data, color, width, height, lossy_quality)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod trellis_tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Reference scalar quantization: plain truncating division in zigzag
+    /// order, and "one past the last non-zero position" as end-of-block -
+    /// exactly what the old, pre-trellis `tokenize_block` did.
+    fn scalar_quantize_zigzag(
+        natural_block: &[i32; 16],
+        plane: Plane,
+        dc_quant: i16,
+        ac_quant: i16,
+    ) -> [i32; 16] {
+        let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
+        let mut zigzag = [0i32; 16];
+        for i in first_coeff..16 {
+            let zigzag_index = usize::from(ZIGZAG[i]);
+            let quant = if zigzag_index > 0 { ac_quant } else { dc_quant };
+            zigzag[i] = natural_block[zigzag_index] / i32::from(quant);
+        }
+        zigzag
+    }
+
+    /// The same `distortion + lambda * rate` total `trellis_quantize_
+    /// block`'s DP computes internally, re-derived from the outside: for a
+    /// full-length (positions `0..16`, already 0 past wherever coding
+    /// actually stopped) zigzag array and the token events that were
+    /// (or would be) emitted for it. Used to check the DP's own optimality
+    /// claim against independently-computed reference numbers, without
+    /// needing to know where the block's end-of-block position was.
+    #[allow(clippy::too_many_arguments)]
+    fn coding_cost(
+        raw: &[i64; 16],
+        zigzag: &[i32; 16],
+        events: &[TokenEvent],
+        first_coeff: usize,
+        dc_quant: i16,
+        ac_quant: i16,
+        probs: &[[[Prob; NUM_DCT_TOKENS - 1]; 3]; 8],
+        lambda: f64,
+    ) -> f64 {
+        let mut cost = 0.0;
+        for i in first_coeff..16 {
+            let step = if i == 0 { dc_quant } else { ac_quant };
+            let diff = i64::from(zigzag[i]) * i64::from(step) - raw[i];
+            cost += (diff * diff) as f64;
+        }
+        for event in events {
+            let bits = coeff_token_bit_cost(
+                &probs[event.band][event.context],
+                event.token,
+                event.start_index,
+                event.quantized_value,
+            );
+            cost += lambda * bits;
+        }
+        cost
+    }
+
+    /// Trellis quantization is a search over a superset of what plain scalar
+    /// quantization does (scalar's own level is always one of the
+    /// candidates, and "stop now" is always at least as available as
+    /// scalar's implicit natural end-of-block), so for *any* block and
+    /// *any* lambda, its `distortion + lambda * rate` total can never be
+    /// worse than scalar's. This is the DP's core correctness property,
+    /// independent of whether a given lambda happens to help real-world
+    /// compression - that's `examples/rd_eval`'s job, this is "did the
+    /// search actually search".
+    #[test]
+    fn trellis_cost_never_exceeds_scalar() {
+        let mut rng = rand::thread_rng();
+        for plane in [Plane::YCoeff1, Plane::Y2, Plane::Chroma, Plane::YCoeff0] {
+            let first_coeff = if plane == Plane::YCoeff1 { 1 } else { 0 };
+            for _ in 0..2000 {
+                let mut natural = [0i32; 16];
+                for v in natural.iter_mut() {
+                    *v = rng.gen_range(-600..=600);
+                }
+                let dc_quant = rng.gen_range(4..=157);
+                let ac_quant = rng.gen_range(4..=284);
+                let initial_context = rng.gen_range(0..=2usize);
+                // Sweep several orders of magnitude, since the DP's branch
+                // structure (which candidate/stop option wins) changes
+                // qualitatively across that range.
+                let lambda = 10f64.powf(rng.gen_range(-3.0..4.0));
+                let probs = &COEFF_PROBS[plane as usize];
+
+                let mut raw = [0i64; 16];
+                for i in first_coeff..16 {
+                    raw[i] = i64::from(natural[usize::from(ZIGZAG[i])]);
+                }
+
+                let scalar_zigzag = scalar_quantize_zigzag(&natural, plane, dc_quant, ac_quant);
+                let scalar_eob = scalar_zigzag
+                    .iter()
+                    .rev()
+                    .position(|x| *x != 0)
+                    .map_or(0, |last| 16 - last);
+                let (scalar_events, _) =
+                    events_from_quantized(&scalar_zigzag, scalar_eob, plane, initial_context);
+                let scalar_cost = coding_cost(
+                    &raw,
+                    &scalar_zigzag,
+                    &scalar_events,
+                    first_coeff,
+                    dc_quant,
+                    ac_quant,
+                    probs,
+                    lambda,
+                );
+
+                let (trellis_natural, trellis_events, _) = trellis_quantize_block(
+                    &natural,
+                    plane,
+                    initial_context,
+                    dc_quant,
+                    ac_quant,
+                    probs,
+                    lambda,
+                );
+                let mut trellis_zigzag = [0i32; 16];
+                for i in first_coeff..16 {
+                    trellis_zigzag[i] = trellis_natural[usize::from(ZIGZAG[i])];
+                }
+                let trellis_cost = coding_cost(
+                    &raw,
+                    &trellis_zigzag,
+                    &trellis_events,
+                    first_coeff,
+                    dc_quant,
+                    ac_quant,
+                    probs,
+                    lambda,
+                );
+
+                assert!(
+                    trellis_cost <= scalar_cost + 1e-6,
+                    "trellis cost {trellis_cost} exceeds scalar cost {scalar_cost} \
+                     (plane {:?}, natural {:?}, dc_quant {dc_quant}, ac_quant {ac_quant}, \
+                     initial_context {initial_context}, lambda {lambda})",
+                    plane as usize,
+                    natural,
+                );
+            }
+        }
+    }
+
+    /// The decoder's complexity context for a block is driven by whether it
+    /// actually decodes a non-zero coefficient - so `has_coeffs` has to
+    /// agree with the *emitted events*, not with `end_of_block_index` (see
+    /// `events_from_quantized`'s doc comment on why those can diverge under
+    /// trellis). This checks that agreement directly off the events trellis
+    /// itself produced, across the same sweep as the cost-optimality test.
+    #[test]
+    fn trellis_has_coeffs_matches_emitted_events() {
+        let mut rng = rand::thread_rng();
+        for plane in [Plane::YCoeff1, Plane::Y2, Plane::Chroma, Plane::YCoeff0] {
+            for _ in 0..2000 {
+                let mut natural = [0i32; 16];
+                for v in natural.iter_mut() {
+                    *v = rng.gen_range(-600..=600);
+                }
+                let dc_quant = rng.gen_range(4..=157);
+                let ac_quant = rng.gen_range(4..=284);
+                let initial_context = rng.gen_range(0..=2usize);
+                let lambda = 10f64.powf(rng.gen_range(-3.0..4.0));
+
+                let (_, events, has_coeffs) = trellis_quantize_block(
+                    &natural,
+                    plane,
+                    initial_context,
+                    dc_quant,
+                    ac_quant,
+                    &COEFF_PROBS[plane as usize],
+                    lambda,
+                );
+
+                let any_nonzero_event = events
+                    .iter()
+                    .any(|e| e.token != DCT_EOB && e.quantized_value != 0);
+                assert_eq!(has_coeffs, any_nonzero_event);
+            }
+        }
+    }
 }
