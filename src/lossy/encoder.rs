@@ -691,6 +691,52 @@ struct Vp8Encoder<W> {
     top_border_y: Vec<u8>,
     top_border_u: Vec<u8>,
     top_border_v: Vec<u8>,
+
+    /// Per-macroblock RD mode decision, indexed `mby * macroblock_width +
+    /// mbx`, computed once by `count_skipped_macroblocks` and reused by
+    /// `collect_token_counts` instead of re-running `choose_macroblock_info`'s
+    /// RD search (mode search over 4 luma candidates, B_PRED's 10-mode
+    /// search over 16 sub-blocks, and 4 chroma candidates) a second time for
+    /// the same macroblock.
+    ///
+    /// Deliberately **not** consulted by `encode_image`'s own (real, bit-
+    /// writing) macroblock loop, which still calls `choose_macroblock_info`
+    /// directly - see that call site's comment for why. In short:
+    /// `choose_macroblock_info` (via `trial_luma_bpred`'s
+    /// `bpred_mode_bit_cost` rate term) reads `self.top_b_pred` /
+    /// `self.left_b_pred`, the B_PRED submode entropy context, and that
+    /// context is *only* ever advanced by `write_macroblock_header` - which
+    /// runs exclusively in the real pass. `count_skipped_macroblocks` and
+    /// `collect_token_counts` never call `write_macroblock_header`, so for
+    /// them `top_b_pred`/`left_b_pred` stay frozen at `reset_frame_state`'s
+    /// defaults for the whole frame; verified empirically (temporary
+    /// instrumentation, since reverted) that the two dry runs therefore
+    /// always produce byte-identical `MacroblockInfo` for every macroblock,
+    /// while the real pass - whose context genuinely evolves - disagreed
+    /// with them at roughly 1 in 3 macroblocks on a mixed-activity test
+    /// image, including outright different winning `LumaMode`s and
+    /// `coeffs_skipped` flags, not just different B_PRED submodes. Caching a
+    /// dry-run decision for reuse in the real pass would therefore change
+    /// the encoded bitstream; this cache is what is left of collapsing all
+    /// three passes' searches into one while still keeping the real pass's
+    /// output byte-identical to what it would decide on its own.
+    ///
+    /// Reset once per frame in `setup_encoding` (not in `reset_frame_state`,
+    /// which also runs *between* `count_skipped_macroblocks` and
+    /// `collect_token_counts` - clearing the cache there would erase pass
+    /// 1's results before pass 2 could read them). Sized and reallocated
+    /// there too, so a second `encode_image` call on the same encoder - even
+    /// at different dimensions - can never read a stale entry left over from
+    /// a previous frame.
+    ///
+    /// `MacroblockInfo` is small (a `LumaMode`, an `Option<[IntraMode; 16]>`,
+    /// a `ChromaMode`, an `Option<u8>`, a `bool`) - a few hundred KB for a
+    /// whole 1080p frame's worth of macroblocks - so caching the decision
+    /// itself, rather than the transform output (which stays uncached; see
+    /// `transform_luma_block` / `transform_chroma_blocks`, which run fresh
+    /// in every pass because they also carry border/complexity state each
+    /// pass depends on), is cheap.
+    mb_info_cache: Vec<Option<MacroblockInfo>>,
 }
 
 impl<W: Write> Vp8Encoder<W> {
@@ -729,6 +775,8 @@ impl<W: Write> Vp8Encoder<W> {
             top_border_y: Vec::new(),
             top_border_u: Vec::new(),
             top_border_v: Vec::new(),
+
+            mb_info_cache: Vec::new(),
         }
     }
 
@@ -1240,6 +1288,17 @@ impl<W: Write> Vp8Encoder<W> {
             self.left_border_v = [129u8; 8 + 1];
 
             for mbx in 0..self.macroblock_width {
+                // Deliberately NOT read from `mb_info_cache` here, unlike
+                // `collect_token_counts`: this loop calls
+                // `write_macroblock_header` just below, which is the only
+                // place `top_b_pred`/`left_b_pred` (the B_PRED submode
+                // entropy context `choose_macroblock_info` costs its
+                // candidates against) ever get updated. That makes this
+                // pass's mode decisions genuinely different, in general,
+                // from the two cache-sharing dry runs above - see
+                // `mb_info_cache`'s doc comment for the empirical evidence -
+                // so reusing a cached decision here would change the encoded
+                // bitstream instead of merely computing it faster.
                 let macroblock_info = self.choose_macroblock_info(mbx.into(), mby.into());
 
                 // write macroblock headers
@@ -1786,11 +1845,19 @@ impl<W: Write> Vp8Encoder<W> {
     ///
     /// This intentionally reuses `choose_macroblock_info` /
     /// `transform_luma_block` / `transform_chroma_blocks` verbatim rather
-    /// than re-implementing a cheaper estimate: mode decision only depends
-    /// on pixel data and border state, never on entropy-coding
-    /// probabilities, so the skip decisions made here are exactly the ones
-    /// the real pass will make. The border/b_pred/complexity state this
-    /// mutates is fully reset by `reset_frame_state` immediately afterwards.
+    /// than re-implementing a cheaper estimate: mode decision only depends on
+    /// pixel data, the pixel border state (`top_border_*`/`left_border_*`)
+    /// and the B_PRED submode entropy context (`top_b_pred`/`left_b_pred`),
+    /// never on coefficient entropy-coding probabilities - see
+    /// `collect_token_counts`'s doc comment for why that particular
+    /// distinction matters here.
+    ///
+    /// This is also where `mb_info_cache` is populated (see its doc comment
+    /// on the struct): `collect_token_counts` below runs the identical dry
+    /// run a second time for its own, different, statistic, and reads this
+    /// pass's decisions back out instead of repeating the RD search that
+    /// produced them. The border/b_pred/complexity state this mutates is
+    /// fully reset by `reset_frame_state` immediately afterwards.
     fn count_skipped_macroblocks(&mut self) -> (u32, u32) {
         let mut total = 0u32;
         let mut skipped = 0u32;
@@ -1806,6 +1873,9 @@ impl<W: Write> Vp8Encoder<W> {
                 let info = self.choose_macroblock_info(mbx.into(), mby.into());
                 self.transform_luma_block(mbx.into(), mby.into(), &info);
                 self.transform_chroma_blocks(mbx.into(), mby.into(), &info);
+
+                let idx = usize::from(mby) * usize::from(self.macroblock_width) + usize::from(mbx);
+                self.mb_info_cache[idx] = Some(info);
 
                 total += 1;
                 if info.coeffs_skipped {
@@ -1823,17 +1893,27 @@ impl<W: Write> Vp8Encoder<W> {
     /// `derive_updated_token_probs` turns into the frame header's
     /// coefficient probability updates.
     ///
-    /// Same two-pass shape as `count_skipped_macroblocks` just above, and for
-    /// the same reason: mode decision and reconstruction only depend on
-    /// pixel data and border state, never on entropy-coding probabilities
-    /// (see that method's doc comment), so this can run mode decision for
-    /// real, tokenize every block's actual coefficients
-    /// (`accumulate_residual_token_counts` / `tokenize_block`), and still be
-    /// guaranteed to count exactly the tokens the real encode pass will
-    /// later emit - before the header that has to carry the result is
-    /// written. The border/b_pred/complexity state this mutates is fully
-    /// reset by `reset_frame_state` immediately afterwards, same as after
-    /// `count_skipped_macroblocks`.
+    /// Same two-pass shape as `count_skipped_macroblocks` just above, over
+    /// the same macroblock grid, starting from the same `reset_frame_state`
+    /// defaults, mutating `top_border_*`/`left_border_*`/complexity exactly
+    /// the same way given the same sequence of `MacroblockInfo` - and,
+    /// critically, *never* calling `write_macroblock_header` either, so
+    /// `top_b_pred`/`left_b_pred` stay just as frozen here as they do in
+    /// `count_skipped_macroblocks`. That means this method's mode decisions
+    /// are byte-identical to that method's, macroblock for macroblock, by
+    /// induction on the (matching) border state - which is exactly why this
+    /// reads `mb_info_cache` (filled by `count_skipped_macroblocks`,
+    /// immediately before this runs) instead of calling
+    /// `choose_macroblock_info` again: it would just recompute the same
+    /// answer.
+    ///
+    /// This equivalence does **not** extend to `encode_image`'s real pass -
+    /// see `mb_info_cache`'s doc comment on the struct for why - so unlike
+    /// `count_skipped_macroblocks`, this method does not itself write into
+    /// the cache; it only ever consumes what that method already produced
+    /// for this frame. The border/b_pred/complexity state this mutates is
+    /// fully reset by `reset_frame_state` immediately afterwards, same as
+    /// after `count_skipped_macroblocks`.
     fn collect_token_counts(&mut self) -> TokenCounts {
         let mut counts: TokenCounts = [[[[[0u64; 2]; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
 
@@ -1847,7 +1927,11 @@ impl<W: Write> Vp8Encoder<W> {
             for mbx in 0..self.macroblock_width {
                 let mbx = usize::from(mbx);
                 let mby = usize::from(mby);
-                let info = self.choose_macroblock_info(mbx, mby);
+                let idx = mby * usize::from(self.macroblock_width) + mbx;
+                let info = self.mb_info_cache[idx].expect(
+                    "count_skipped_macroblocks populates every macroblock's cached mode \
+                     decision before collect_token_counts runs",
+                );
 
                 let y_block_data = self.transform_luma_block(mbx, mby, &info);
                 let (u_block_data, v_block_data) = self.transform_chroma_blocks(mbx, mby, &info);
@@ -2145,6 +2229,16 @@ impl<W: Write> Vp8Encoder<W> {
             *segment = build_segment(quant_index, delta, &self.quantization_indices);
         }
         self.segment_tree_probs = segment_tree_probs_for(&self.mb_segment_ids);
+
+        // Fresh, all-`None` per frame - see `mb_info_cache`'s doc comment for
+        // why this lives here rather than in `reset_frame_state` (which also
+        // runs *between* the two dry-run passes that share this cache, and
+        // would erase it mid-frame if it reset it too). Reallocating by the
+        // current `mb_width`/`mb_height` here, on every `encode_image` call,
+        // is also what guarantees a second call on the same encoder - even
+        // at different image dimensions - can never read a stale entry left
+        // over from a previous frame.
+        self.mb_info_cache = vec![None; usize::from(mb_width) * usize::from(mb_height)];
 
         self.reset_frame_state();
     }
