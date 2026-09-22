@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.80.1"
 
-description = "Pure-Rust WebP codec - the only published crate with a lossy (VP8) encoder in pure Rust"
+description = "Pure-Rust WebP codec with a lossy (VP8) encoder - no C, no libwebp bindings"
 homepage = "https://github.com/vaam-apps/vaam-image-webp"
 repository = "https://github.com/vaam-apps/vaam-image-webp"
 categories = ["multimedia::images", "multimedia::encoding", "encoding"]
