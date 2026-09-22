@@ -1,11 +1,11 @@
 [package]
 name = "vaam-image-webp"
-version = "0.3.0-vaam.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.80.1"
 
-description = "WebP encoding and decoding in pure Rust - vaam-apps fork of image-webp, tracking its unreleased lossy (VP8) encoder"
+description = "Pure-Rust WebP codec - the only published crate with a lossy (VP8) encoder in pure Rust"
 homepage = "https://github.com/vaam-apps/vaam-image-webp"
 repository = "https://github.com/vaam-apps/vaam-image-webp"
 categories = ["multimedia::images", "multimedia::encoding", "encoding"]
@@ -13,12 +13,10 @@ categories = ["multimedia::images", "multimedia::encoding", "encoding"]
 include = ["/src", "LICENSE-APACHE", "LICENSE-MIT", "README.md"]
 
 # The *package* is renamed (vaam-image-webp) but the Rust *lib target* keeps
-# upstream's `image_webp` name deliberately. This fork exists only to track
-# upstream's unreleased lossy VP8 encoder until it ships in a crates.io
-# release; renaming the lib target would rewrite every `use image_webp::...`
-# in tests/ and benches/ and turn each one into a merge conflict on every
-# future upstream pull, for no benefit. Downstreams write
-# `vaam-image-webp = { git = ... }` and `use image_webp::...`.
+# upstream's `image_webp` name so this crate is a drop-in replacement:
+# swapping the `image-webp` dependency for `vaam-image-webp` needs no source
+# changes, since `use image_webp::...` keeps resolving. Downstreams write
+# `vaam-image-webp = "..."` and `use image_webp::...`.
 [lib]
 name = "image_webp"
 path = "src/lib.rs"

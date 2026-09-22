@@ -1,63 +1,89 @@
-> ### About this fork
->
-> `vaam-image-webp` is [vaam-apps](https://github.com/vaam-apps)' fork of
-> [`image-rs/image-webp`](https://github.com/image-rs/image-webp), maintained for
-> [`vaam-store/image-resizer`](https://github.com/vaam-store/image-resizer) (EmgR).
->
-> **Why it exists:** EmgR has no C or C++ dependencies. That rules out `libwebp`,
-> which leaves lossy WebP encoding with no published pure-Rust implementation —
-> `image-webp` 0.2.4, the newest release on crates.io, encodes losslessly only, and
-> lossless WebP runs roughly 5–12x larger than lossy on photographic content.
->
-> Upstream's `main` branch *does* have a working lossy VP8 encoder (merged in
-> image-rs/image-webp#161, #164 and #172) — it simply has not been cut into a
-> release. This fork tracks that branch so EmgR can depend on a stable git
-> revision instead of pinning an upstream SHA directly.
->
-> **Divergence from upstream is kept deliberately minimal** — currently the package
-> rename, a corrected `WebPEncoder::new` doc comment, and this note. The Rust lib
-> target is still named `image_webp`, so downstream code reads
-> `use image_webp::...` unchanged. Everything else is upstream's work under
-> upstream's MIT/Apache-2.0 licensing.
->
-> **This fork is temporary.** When upstream releases lossy encoding to crates.io,
-> EmgR should switch back to the upstream crate and this fork should be archived.
+# vaam-image-webp
 
-# image-webp
+[![crates.io](https://img.shields.io/crates/v/vaam-image-webp.svg)](https://crates.io/crates/vaam-image-webp)
+[![Documentation](https://docs.rs/vaam-image-webp/badge.svg)](https://docs.rs/vaam-image-webp)
+[![Build Status](https://github.com/vaam-apps/vaam-image-webp/workflows/Rust%20CI/badge.svg)](https://github.com/vaam-apps/vaam-image-webp/actions)
 
-[![crates.io](https://img.shields.io/crates/v/image-webp.svg)](https://crates.io/crates/image-webp)
-[![Documentation](https://docs.rs/image-webp/badge.svg)](https://docs.rs/image-webp)
-[![Build Status](https://github.com/image-rs/image-webp/workflows/Rust%20CI/badge.svg)](https://github.com/image-rs/image-webp/actions)
+`vaam-image-webp` is a pure-Rust WebP codec. As far as we know, it is the only
+published crate that encodes **lossy** (VP8) WebP without linking `libwebp` or
+any other C/C++ code — every other pure-Rust option we're aware of,
+including upstream `image-webp` 0.2.4, only encodes losslessly, and lossless
+WebP runs roughly **5-12x larger** than lossy on photographic content.
 
-This crate is an independent implementation of the WebP image format, written so
-that the `image` crate can have a pure-Rust WebP backend for both encoding and
-decoding.
+Use it when you need WebP output and cannot or would rather not link C:
+sandboxed environments, cross-compilation targets where `libwebp` is a
+headache, supply-chain policies that forbid C dependencies, or WASM.
 
-## Current Status
+## The trade-off
 
-* **Decoder:** Supports all WebP format features including both lossless and
-  lossy compression, alpha channel, and animation. Both the "simple" and
-  "extended" formats are handled, and it exposes methods to extract ICC, EXIF,
-  and XMP chunks. Decoding speed is generally in the range of **70-100%** of the
-  speed of libwebp.
+This is not a faster or smaller alternative to libwebp — it's what you reach
+for when linking libwebp isn't an option. Measured on the 24-image Kodak
+suite, lossy output from this crate compared against libwebp:
 
-* **Encoder:** This crate only supports lossless encoding. The encoder
-  implementation is relatively basic which makes it very fast, but it doesn't
-  get as good compression ratios as libwebp can. Nonetheless, it often produces
-  smaller files than PNG, even when compared against the slowest/highest
-  compression options of PNG encoders.
+* **File size:** 1.17-1.21x libwebp's size at matched DSSIM (i.e. our files
+  are 17-21% larger for the same perceptual quality).
+* **Encode speed:** ~2.7x libwebp's encode time (i.e. we are slower, not
+  faster).
+* **Decoder conformance:** 72/72 bit-exact against libwebp on the same suite.
 
-## Future possibilities
+You're trading bytes and CPU for not linking C. If neither of those trades
+work for your use case, use `libwebp` (or the `webp` crate, which wraps it)
+instead.
 
-* We continue to be interested in **optimizations** and **bug fixes** and hope
-  the bring the decoder closer to parity with libwebp.
+## Current status
 
-* Another potential area is **animation encoding**. Much of the groundwork is in
-  place for this, but it will require some additional work to implement.
+* **Decoder:** supports all WebP format features — lossless, lossy, alpha
+  channel, and animation, both "simple" and "extended" formats — and exposes
+  methods to extract ICC, EXIF, and XMP chunks. Decoding speed is generally
+  70-100% of libwebp's.
 
-* We would like to add **lossy encoding** support, but this is a non-trivial
-  task and would require a lot of work. If you are interested in helping with
-  this, please get in touch!
+* **Encoder:** supports both lossless and lossy (VP8) encoding. Lossless
+  encoding is unchanged from upstream: fast, simple, and often smaller than
+  PNG even against the slowest PNG encoders, though not as tight as libwebp.
+  Lossy encoding is this crate's addition over upstream — see the trade-off
+  numbers above for how it compares.
+
+## Usage
+
+```rust
+use image_webp::{WebPEncoder, WebPDecoder};
+```
+
+Note the crate is `vaam-image-webp` but the library is still named
+`image_webp` (see [Relationship to upstream](#relationship-to-upstream)), so
+`Cargo.toml` and source imports look like:
+
+```toml
+[dependencies]
+vaam-image-webp = "0.1"
+```
+
+See [docs.rs](https://docs.rs/vaam-image-webp) for the full API.
+
+## Relationship to upstream
+
+This crate is a fork of [`image-rs/image-webp`](https://github.com/image-rs/image-webp),
+maintained by [vaam-apps](https://github.com/vaam-apps). It exists because
+upstream's lossy VP8 encoder has not shipped in a crates.io release: `main`
+has one, `0.2.4` doesn't. Rather than depend on an upstream git SHA
+indefinitely, we publish it as its own crate with its own version line,
+starting at `0.1.0`.
+
+What we do:
+
+* Track upstream's decoder and lossless encoder as closely as practical.
+* Add and maintain the lossy (VP8) encoder — adaptive quantisation, RD-aware
+  mode decisions, and the arithmetic coder that goes with them.
+* Upstream bug fixes we find (decoder or shared code) go back to upstream via
+  PR, not just fixed here in isolation.
+
+The Rust lib target is still named `image_webp`, matching upstream, so this
+crate is a drop-in replacement — swapping the dependency line is enough, no
+import changes needed.
+
+Everything not called out above is upstream's work, licensed under upstream's
+terms (see below). Thanks to the `image-rs` maintainers and contributors for
+the decoder, the lossless encoder, and the format work this crate builds on.
 
 ## Unsafe code
 
@@ -68,23 +94,8 @@ necessary in the future to improve performance, but we will always strive to
 minimize the use of unsafe code and ensure that it is well-tested and
 documented.
 
-```
-$ cargo geiger
+## License
 
-Metric output format: x/y
-    x = unsafe code used by the build
-    y = total unsafe code found in the crate
-
-Symbols:
-    🔒  = No `unsafe` usage found, declares #![forbid(unsafe_code)]
-    ❓  = No `unsafe` usage found, missing #![forbid(unsafe_code)]
-    ☢️   = `unsafe` usage found
-
-Functions  Expressions  Impls  Traits  Methods  Dependency
-
-0/0        0/0          0/0    0/0     0/0      🔒 image-webp 0.2.3
-0/0        0/0          0/0    0/0     0/0      🔒 ├── byteorder-lite 0.1.0
-0/0        0/0          0/0    0/0     0/0      ❓ └── quick-error 2.0.1
-
-0/0        0/0          0/0    0/0     0/0
-```
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option, matching upstream
+`image-rs/image-webp`'s licensing.
