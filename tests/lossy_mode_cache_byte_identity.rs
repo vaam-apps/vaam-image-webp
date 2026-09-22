@@ -2,6 +2,29 @@
 //! `choose_macroblock_info`'s per-macroblock RD mode decision instead of
 //! recomputing it on every pass of `encode_image`).
 //!
+//! # image-resizer#151 changed what this test can promise
+//!
+//! image-resizer#151 fixed the B_PRED entropy context (`top_b_pred`/
+//! `left_b_pred`) being frozen during `count_skipped_macroblocks` /
+//! `collect_token_counts`, and then extended `mb_info_cache` to also cover
+//! `encode_image`'s real pass. Mode decisions and coefficients are
+//! unaffected by that fix (see `mb_info_cache`'s doc comment on
+//! `Vp8Encoder` and `tests/lossy_bpred_context_pixel_identity.rs`, which is
+//! the dedicated regression test for that property) - but the frame
+//! header's `prob_skip_false` and coefficient probabilities now describe
+//! the encode that actually happens instead of one decided with a stale
+//! B_PRED context, so the *entropy coding* of those same modes/coefficients
+//! legitimately changed. That means the exact byte-for-byte `EXPECTED`
+//! table below, captured before #151, no longer matches - by design, not by
+//! regression.
+//!
+//! `byte_identity_matches_pre_cache_baseline` below has been narrowed
+//! accordingly: it still compares against the same `EXPECTED` byte
+//! reference, but only far enough to keep this file's original guarantee
+//! for image-resizer#136 - that caching the RD mode decision across passes
+//! never changes what gets *decoded* - by decoding the current output and
+//! comparing pixels instead of comparing the container bytes wholesale.
+//!
 //! # Where the expected `(len, hash)` values came from
 //!
 //! They are the literal output of this same test file's `print_reference_values`
@@ -20,6 +43,10 @@
 //! 5. the mode-decision cache was then implemented, and this test re-run to
 //!    confirm the hashes are unchanged.
 //!
+//! `EXPECTED` is kept as-is (rather than re-captured post-#151) precisely
+//! because it is no longer compared byte-for-byte - see above - only decoded
+//! and compared at the pixel level, which #151 does not change.
+//!
 //! The hash is a 64-bit FNV-1a over the raw encoded WebP container bytes
 //! (RIFF header included), deliberately not a cryptographic hash and not from
 //! an external crate: this is a same-process regression check against a
@@ -29,7 +56,9 @@
 //! alongside the hash so a truncated-output bug can't hide behind a
 //! coincidental hash match.
 
-use image_webp::{ColorType, EncoderParams, WebPEncoder};
+use std::io::Cursor;
+
+use image_webp::{ColorType, EncoderParams, WebPDecoder, WebPEncoder};
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -231,11 +260,29 @@ fn encode(fixture: &Fixture) -> Vec<u8> {
     output
 }
 
+/// Decodes a WebP container back to a raw RGB/RGBA pixel buffer (3 or 4
+/// bytes per pixel depending on `has_alpha`) - what
+/// `byte_identity_matches_pre_cache_baseline` below now compares, since
+/// image-resizer#151 (see this file's top-level doc comment).
+fn decode(bytes: &[u8]) -> Vec<u8> {
+    let mut decoder = WebPDecoder::new(Cursor::new(bytes)).expect("produced a valid webp");
+    let (width, height) = decoder.dimensions();
+    let bytes_per_pixel = if decoder.has_alpha() { 4 } else { 3 };
+    let mut data = vec![0u8; width as usize * height as usize * bytes_per_pixel];
+    decoder
+        .read_image(&mut data)
+        .expect("decode the image we just encoded");
+    data
+}
+
 /// Not run by default (`cargo test` skips `#[ignore]`d tests). Run explicitly
 /// with `cargo test --test lossy_mode_cache_byte_identity print_reference_values
 /// -- --ignored --nocapture` to (re-)generate the `EXPECTED` table below -
 /// see this file's top-level doc comment for how the current table was
-/// produced, against `7feed60`.
+/// produced, against `7feed60`. Still prints the raw-container hash/len,
+/// not the pixel-level values `EXPECTED_PIXELS` holds - `EXPECTED` is no
+/// longer asserted against directly (see the top-level doc comment) but is
+/// kept for provenance/documentation.
 #[test]
 #[ignore]
 fn print_reference_values() {
@@ -252,7 +299,9 @@ fn print_reference_values() {
 
 /// `(fixture name, encoded byte length, FNV-1a 64 hash of the encoded WebP
 /// container)`, captured against `7feed60` - see this file's top-level doc
-/// comment.
+/// comment. Historical/documentation only as of image-resizer#151: no
+/// longer compared byte-for-byte (see `EXPECTED_PIXELS` below for what is).
+#[allow(dead_code)]
 const EXPECTED: &[(&str, usize, u64)] = &[
     ("flat_multiple16", 82, 0xd8e81983fa17e6ce),
     ("flat_nonmultiple16", 148, 0x3a7834fff1b96815),
@@ -266,35 +315,63 @@ const EXPECTED: &[(&str, usize, u64)] = &[
     ("tiny_subblock_nonmultiple16", 252, 0x924c6d1f1f20508b),
 ];
 
+/// `(fixture name, decoded pixel buffer byte length, FNV-1a 64 hash of the
+/// decoded pixel buffer)`. These fixtures are byte-for-byte identical
+/// (name, dimensions, color type, quality, pixel generator) to
+/// `tests/lossy_bpred_context_pixel_identity.rs`'s, and `EXPECTED` above
+/// already proved `7feed60`'s and (pre-#151) `da8181d`'s encoded bytes were
+/// identical for them - so the decoded-pixel reference values that file
+/// captured against `da8181d` apply here unchanged; see its top-level doc
+/// comment for exactly how they were captured.
+const EXPECTED_PIXELS: &[(&str, usize, u64)] = &[
+    ("flat_multiple16", 9216, 0xafc3bbf9d4331725),
+    ("flat_nonmultiple16", 6201, 0x0eb251ad576ac798),
+    ("noisy_nonmultiple16", 38121, 0x59f6fd8c6d7a6752),
+    (
+        "gradient_checkerboard_nonmultiple16",
+        90000,
+        0xf2fe7570cbb253bf,
+    ),
+    ("alpha_rgba_nonmultiple16", 25200, 0x6e41fde0cbf41f00),
+    ("tiny_subblock_nonmultiple16", 270, 0x01b6e0963fad0adb),
+];
+
 /// The correctness bar for image-resizer#136: caching `choose_macroblock_info`'s
 /// mode decision (instead of recomputing it on every one of `encode_image`'s
-/// three passes) must produce byte-for-byte identical output to the
-/// pre-caching encoder. `EXPECTED` is what the pre-caching code (`7feed60`)
-/// produced for each fixture; this test re-encodes the same fixtures with
-/// the current code and asserts nothing moved.
+/// three passes) must not change what the encoder produces. Through
+/// image-resizer#150 that was checked byte-for-byte against `EXPECTED`; as
+/// of image-resizer#151 the encoded bytes legitimately differ (see this
+/// file's top-level doc comment), so this now decodes both the current
+/// output and checks it against `EXPECTED_PIXELS` - the pixel-level part of
+/// the original guarantee, which #151 preserves.
 #[test]
 fn byte_identity_matches_pre_cache_baseline() {
     let fixtures = fixtures();
-    assert_eq!(fixtures.len(), EXPECTED.len(), "fixture list changed size");
+    assert_eq!(
+        fixtures.len(),
+        EXPECTED_PIXELS.len(),
+        "fixture list changed size"
+    );
 
-    for (fixture, &(expected_name, expected_len, expected_hash)) in
-        fixtures.iter().zip(EXPECTED.iter())
+    for (fixture, &(expected_name, expected_decoded_len, expected_pixel_hash)) in
+        fixtures.iter().zip(EXPECTED_PIXELS.iter())
     {
         assert_eq!(fixture.name, expected_name, "fixture order changed");
 
         let bytes = encode(fixture);
-        let actual_hash = fnv1a_64(&bytes);
+        let decoded = decode(&bytes);
+        let actual_pixel_hash = fnv1a_64(&decoded);
 
         assert_eq!(
-            (bytes.len(), actual_hash),
-            (expected_len, expected_hash),
-            "fixture '{}' encoded to different bytes than the 7feed60 baseline \
-             (len {} vs expected {}, hash {:016x} vs expected {:016x})",
+            (decoded.len(), actual_pixel_hash),
+            (expected_decoded_len, expected_pixel_hash),
+            "fixture '{}' decoded to different pixels than the pre-cache baseline \
+             (decoded len {} vs expected {}, pixel hash {:016x} vs expected {:016x})",
             fixture.name,
-            bytes.len(),
-            expected_len,
-            actual_hash,
-            expected_hash,
+            decoded.len(),
+            expected_decoded_len,
+            actual_pixel_hash,
+            expected_pixel_hash,
         );
     }
 }
