@@ -4,6 +4,7 @@ use byteorder_lite::{LittleEndian, WriteBytesExt};
 
 use super::arithmetic_encoder::{tree_encode_path, ArithmeticEncoder};
 use super::common::*;
+use super::loop_filter;
 use super::prediction::*;
 use super::transform;
 use super::yuv::convert_image_y;
@@ -63,6 +64,26 @@ struct MacroblockInfo {
     segment_id: Option<usize>,
 
     coeffs_skipped: bool,
+
+    /// Mirrors `Vp8Decoder`'s per-macroblock `MacroBlock::non_zero_dct`
+    /// (`lossy/mod.rs`): true iff, once this macroblock is actually
+    /// reconstructed, any of its luma or chroma sub-blocks has a nonzero
+    /// (dequantized) coefficient. Used by `apply_loop_filter`
+    /// (image-resizer#137 stage 2) exactly the way the decoder's
+    /// `loop_filter` uses it - to decide `do_subblock_filtering` (15.2):
+    /// `mb.luma_mode == LumaMode::B || (!mb.coeffs_skipped &&
+    /// mb.non_zero_dct)`.
+    ///
+    /// Unlike every other field on this struct, this is *not* known at
+    /// `choose_macroblock_info` time - it depends on the actual quantized
+    /// residual, which only exists once `transform_luma_block` /
+    /// `transform_chroma_blocks` run. `MacroblockInfo::default()` and every
+    /// other place that builds one before reconstruction (`choose_
+    /// macroblock_info`) leaves this `false`; `encode_image`'s real pass is
+    /// the only place that fills in the real value, immediately after
+    /// reconstructing each macroblock, by overwriting that macroblock's
+    /// `mb_info_cache` entry.
+    non_zero_dct: bool,
 }
 
 struct Luma16x16Coeffs {
@@ -238,6 +259,55 @@ const LAMBDA_SCALE: f64 = 0.02;
 fn mode_decision_lambda(segment: &Segment) -> f64 {
     let qstep = f64::from(segment.yac);
     LAMBDA_SCALE * qstep * qstep
+}
+
+// --- Loop filter level derivation --------------------------------------
+//
+// image-resizer#137: the encoder now applies VP8's in-loop deblocking
+// filter to its own reconstruction (`Vp8Encoder::apply_loop_filter`,
+// mirroring `Vp8Decoder::loop_filter`), instead of hardcoding
+// `frame.filter_level` to 0 to avoid the quality loss an unconditional
+// maximal filter caused (see `setup_encoding`'s doc comment on
+// `Frame::filter_level` for that history). `derive_filter_level` is what
+// picks the level to actually apply.
+
+/// Empirical scale factor for `derive_filter_level`: divides the base
+/// quantiser index (`quant_index`, 0..=127) to get the filter level
+/// (0..=63). Picked so the coarsest quantiser (127) lands on a level well
+/// short of the maximum (63) - a level of 63 unconditionally is exactly the
+/// failure mode this replaces - while the finest quantisers (where blocking
+/// is barely visible to begin with) stay at or near 0.
+const FILTER_LEVEL_DIVISOR: u32 = 4;
+
+/// Derives the frame-level VP8 loop filter strength (`frame.filter_level`,
+/// 9.4/15) from the base luma-AC quantiser index (`quant_index`, 0..=127 -
+/// the same value `setup_encoding` derives from `lossy_quality` and feeds to
+/// `build_segment`).
+///
+/// Modelled on the general principle libvpx's own encoder uses for its
+/// default (non-`--noise-sensitivity`, non-two-pass-tuned) filter level: a
+/// coarser quantiser produces more visible blocking at macroblock and
+/// sub-block edges, so it needs a stronger filter to smooth over it, while a
+/// fine quantiser already reproduces those edges accurately and a strong
+/// filter would only blur real detail. This is a plain linear mapping
+/// (`quant_index / FILTER_LEVEL_DIVISOR`, clamped to the format's 0..=63
+/// range) rather than libvpx's own piecewise/table-based curve - the exact
+/// shape of that curve is undocumented in this codebase and not worth
+/// reverse-engineering when a monotonic, order-of-magnitude-correct mapping
+/// already recovers most of the benefit (see the `Frame::filter_level` doc
+/// comment history this replaces: the failure mode was the level being
+/// *disconnected* from the quantiser, maxed out regardless of it, not the
+/// exact curve).
+///
+/// `FILTER_LEVEL_DIVISOR` is the one knob here, kept as a named constant so
+/// it can be retuned in isolation. It has not been swept against
+/// `examples/rd_eval`/`examples/ssimu2_eval` the way `LAMBDA_SCALE` and
+/// `SEGMENT_QUANT_DELTAS` were (that sweep is left for the caller to run
+/// against the real corpus, per this change's own instructions) - treat it
+/// as a reasonable starting point, not a calibrated constant.
+fn derive_filter_level(quant_index: u8) -> u8 {
+    let level = u32::from(quant_index) / FILTER_LEVEL_DIVISOR;
+    level.min(63) as u8
 }
 
 /// `prob_skip_false` (9.10/19.2 in the spec) is the probability, scaled to a
@@ -683,15 +753,38 @@ struct Vp8Encoder<W> {
     /// Partitions of encoders for the macroblock coefficient data
     partitions: Vec<ArithmeticEncoder>,
 
-    // the left borders used in prediction
-    left_border_y: [u8; 16 + 1],
-    left_border_u: [u8; 8 + 1],
-    left_border_v: [u8; 8 + 1],
-
-    // the top borders used in prediction
-    top_border_y: Vec<u8>,
-    top_border_u: Vec<u8>,
-    top_border_v: Vec<u8>,
+    /// Full-frame *unfiltered* luma reconstruction plane. Sized from the
+    /// macroblock grid, `macroblock_width * 16` columns by
+    /// `macroblock_height * 16` rows (row-major, stride
+    /// `macroblock_width * 16`) - exactly like the decoder's own
+    /// `Frame::ybuf` (`Vp8Decoder::new`, `lossy/mod.rs`), including padding
+    /// past the image's real `width`/`height` for partial edge
+    /// macroblocks, which is why this is sized from the macroblock grid
+    /// rather than the image.
+    ///
+    /// Replaces the old `top_border_y`/`left_border_y` incremental caches
+    /// (image-resizer#137 stage 1): `transform_luma_block` /
+    /// `transform_luma_blocks_4x4` write each macroblock's reconstruction
+    /// in here immediately after computing it, and
+    /// `create_border_luma_from_plane` (`prediction.rs`) reads the borders
+    /// for every later macroblock straight back out of it - see that
+    /// function's doc comment for why raster-order encoding makes that
+    /// byte-identical to the caches it replaces.
+    ///
+    /// The reason to keep the *plane*, not just borders, at all: the VP8
+    /// loop filter (image-resizer#137 stage 2, `apply_loop_filter`) is
+    /// in-loop with respect to becoming a reference/output frame, and
+    /// modifies pixels up to 3 rows/columns deep on either side of a
+    /// macroblock edge - far more than a 1-pixel border cache can supply.
+    /// Once the plane has to exist for that, deriving borders from it is
+    /// simpler than maintaining both a plane and a duplicate cache.
+    recon_y: Vec<u8>,
+    /// Chroma (U) counterpart of `recon_y`, sized `macroblock_width * 8` by
+    /// `macroblock_height * 8`.
+    recon_u: Vec<u8>,
+    /// Chroma (V) counterpart of `recon_y`, sized `macroblock_width * 8` by
+    /// `macroblock_height * 8`.
+    recon_v: Vec<u8>,
 
     /// Per-macroblock RD mode decision, indexed `mby * macroblock_width +
     /// mbx`, computed once by `count_skipped_macroblocks` and reused by
@@ -783,12 +876,9 @@ impl<W: Write> Vp8Encoder<W> {
 
             partitions: vec![ArithmeticEncoder::new()],
 
-            left_border_y: [0u8; 16 + 1],
-            left_border_u: [0u8; 8 + 1],
-            left_border_v: [0u8; 8 + 1],
-            top_border_y: Vec::new(),
-            top_border_u: Vec::new(),
-            top_border_v: Vec::new(),
+            recon_y: Vec::new(),
+            recon_u: Vec::new(),
+            recon_v: Vec::new(),
 
             mb_info_cache: Vec::new(),
         }
@@ -1348,10 +1438,6 @@ impl<W: Write> Vp8Encoder<W> {
             self.left_complexity = Complexity::default();
             self.left_b_pred = [IntraMode::default(); 4];
 
-            self.left_border_y = [129u8; 16 + 1];
-            self.left_border_u = [129u8; 8 + 1];
-            self.left_border_v = [129u8; 8 + 1];
-
             for mbx in 0..self.macroblock_width {
                 // Reads the decision `count_skipped_macroblocks` already made
                 // for this macroblock instead of calling
@@ -1382,11 +1468,21 @@ impl<W: Write> Vp8Encoder<W> {
                 // calls `intra_predict_luma`/`intra_predict_chroma`, just with
                 // an all-zero coefficient block when `coeffs_skipped`). Only
                 // the bit-writing below is conditional.
-                let y_block_data =
+                let (y_block_data, luma_non_zero_dct) =
                     self.transform_luma_block(mbx.into(), mby.into(), &macroblock_info);
 
-                let (u_block_data, v_block_data) =
+                let (u_block_data, v_block_data, chroma_non_zero_dct) =
                     self.transform_chroma_blocks(mbx.into(), mby.into(), &macroblock_info);
+
+                // Recorded for `apply_loop_filter` (image-resizer#137 stage
+                // 2), which runs once over the whole frame after this loop
+                // finishes and needs to know, per macroblock, whether the
+                // decoder would have set `MacroBlock::non_zero_dct` - see
+                // `MacroblockInfo::non_zero_dct`'s doc comment.
+                self.mb_info_cache[idx] = Some(MacroblockInfo {
+                    non_zero_dct: luma_non_zero_dct || chroma_non_zero_dct,
+                    ..macroblock_info
+                });
 
                 if !macroblock_info.coeffs_skipped {
                     self.encode_residual_data(
@@ -1408,6 +1504,14 @@ impl<W: Write> Vp8Encoder<W> {
             }
         }
 
+        // Every macroblock is now reconstructed (unfiltered) in `recon_y`/
+        // `recon_u`/`recon_v`, and every `mb_info_cache` entry has its real
+        // `non_zero_dct` filled in - exactly the precondition
+        // `apply_loop_filter` documents. This mirrors `Vp8Decoder::
+        // decode_frame_`'s own structure: reconstruct the whole frame
+        // first, unfiltered, then filter it in one pass afterwards.
+        self.apply_loop_filter();
+
         let compressed_header_encoder = std::mem::take(&mut self.encoder);
         let compressed_header_bytes = compressed_header_encoder.flush_and_get_buffer();
 
@@ -1418,6 +1522,329 @@ impl<W: Write> Vp8Encoder<W> {
         self.write_partitions()?;
 
         Ok(())
+    }
+
+    /// Mirrors `Vp8Decoder::calculate_filter_parameters` (`lossy/mod.rs`)
+    /// exactly: given this frame's filter settings and one macroblock's
+    /// segment, returns `(filter_level, interior_limit, hev_threshold)` for
+    /// that macroblock - the same three values that same-named decoder
+    /// method computes from the bitstream this encoder is about to emit.
+    /// Any divergence here is drift between what `apply_loop_filter`
+    /// applies to `recon_y`/`recon_u`/`recon_v` and what a real decoder
+    /// will compute and apply from the emitted frame header.
+    ///
+    /// Unlike the decoder, this never reads a ref/mode delta adjustment:
+    /// `self.loop_filter_adjustments` is always `false` (see its field doc
+    /// comment - `encode_loop_filter_adjustments` is unimplemented and
+    /// never called), matching `Vp8Decoder::loop_filter_adjustments_enabled`
+    /// on every stream this encoder emits, so the decoder's corresponding
+    /// branch never fires either; mirroring it here would be dead code on
+    /// both sides.
+    fn calculate_filter_parameters(&self, segment_id: usize) -> (u8, u8, u8) {
+        let segment = self.segments[segment_id];
+        let mut filter_level = i32::from(self.frame.filter_level);
+
+        if filter_level == 0 {
+            return (0, 0, 0);
+        }
+
+        if self.segments_enabled {
+            if segment.delta_values {
+                filter_level += i32::from(segment.loopfilter_level);
+            } else {
+                filter_level = i32::from(segment.loopfilter_level);
+            }
+        }
+
+        let filter_level = filter_level.clamp(0, 63) as u8;
+
+        let mut interior_limit = filter_level;
+        if self.frame.sharpness_level > 0 {
+            interior_limit >>= if self.frame.sharpness_level > 4 { 2 } else { 1 };
+            if interior_limit > 9 - self.frame.sharpness_level {
+                interior_limit = 9 - self.frame.sharpness_level;
+            }
+        }
+        if interior_limit == 0 {
+            interior_limit = 1;
+        }
+
+        let hev_threshold = if filter_level >= 40 {
+            2
+        } else if filter_level >= 15 {
+            1
+        } else {
+            0
+        };
+
+        (filter_level, interior_limit, hev_threshold)
+    }
+
+    /// Applies the VP8 in-loop deblocking filter (15) to this frame's own
+    /// reconstruction planes (`recon_y`/`recon_u`/`recon_v`), in place -
+    /// the encoder-side mirror of `Vp8Decoder::loop_filter`, run once over
+    /// the whole macroblock grid from `encode_image`, immediately after
+    /// every macroblock has been reconstructed.
+    ///
+    /// # Why intra prediction was never at risk from this
+    ///
+    /// VP8's loop filter is in-loop in the sense that matters for a video
+    /// codec - the filtered frame is what becomes the reference for future
+    /// frames' inter prediction, and what gets displayed - but *within* one
+    /// frame's own decode, intra prediction always reads unfiltered
+    /// neighbours in both this encoder and the decoder: `decode_frame_`
+    /// (`lossy/mod.rs`) reconstructs every macroblock first (a complete
+    /// `mby`/`mbx` raster pass calling `intra_predict_luma`/
+    /// `intra_predict_chroma`), and only *then* runs a second, separate
+    /// raster pass calling `loop_filter` - the same two-phase structure
+    /// this method and its caller now give the encoder. So the filter
+    /// never had anything to do with why `filter_level` used to have to
+    /// stay 0; that was purely because the encoder never *applied* the
+    /// filter it was signalling (see `setup_encoding`'s doc comment on
+    /// `Frame::filter_level`), not because filtering would have desynced
+    /// prediction. What this method's ordering has to get right is calling
+    /// `loop_filter::` in the same order, and choosing the same
+    /// macroblock/subblock and simple/normal filter, `Vp8Decoder::
+    /// loop_filter` does - not intra-prediction timing.
+    fn apply_loop_filter(&mut self) {
+        if self.frame.filter_level == 0 {
+            return;
+        }
+
+        let luma_w = usize::from(self.macroblock_width) * 16;
+        let chroma_w = usize::from(self.macroblock_width) * 8;
+
+        for mby in 0..usize::from(self.macroblock_height) {
+            for mbx in 0..usize::from(self.macroblock_width) {
+                let idx = mby * usize::from(self.macroblock_width) + mbx;
+                let info = self.mb_info_cache[idx].expect(
+                    "encode_image's real pass fills in every macroblock's non_zero_dct \
+                     before apply_loop_filter runs",
+                );
+                let segment_id = info.segment_id.unwrap_or(0);
+                let (filter_level, interior_limit, hev_threshold) =
+                    self.calculate_filter_parameters(segment_id);
+
+                if filter_level == 0 {
+                    continue;
+                }
+
+                let mbedge_limit = (filter_level + 2) * 2 + interior_limit;
+                let sub_bedge_limit = (filter_level * 2) + interior_limit;
+
+                // we skip subblock filtering if the coding mode isn't B_PRED and there's no DCT coefficient coded
+                let do_subblock_filtering =
+                    info.luma_mode == LumaMode::B || (!info.coeffs_skipped && info.non_zero_dct);
+
+                //filter across left of macroblock
+                if mbx > 0 {
+                    //simple loop filtering
+                    if self.frame.filter_type {
+                        for y in 0usize..16 {
+                            let y0 = mby * 16 + y;
+                            let x0 = mbx * 16;
+
+                            loop_filter::simple_segment_horizontal(
+                                mbedge_limit,
+                                &mut self.recon_y[y0 * luma_w + x0 - 4..][..8],
+                            );
+                        }
+                    } else {
+                        for y in 0usize..16 {
+                            let y0 = mby * 16 + y;
+                            let x0 = mbx * 16;
+
+                            loop_filter::macroblock_filter_horizontal(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_y[y0 * luma_w + x0 - 4..][..8],
+                            );
+                        }
+
+                        for y in 0usize..8 {
+                            let y0 = mby * 8 + y;
+                            let x0 = mbx * 8;
+
+                            loop_filter::macroblock_filter_horizontal(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_u[y0 * chroma_w + x0 - 4..][..8],
+                            );
+                            loop_filter::macroblock_filter_horizontal(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_v[y0 * chroma_w + x0 - 4..][..8],
+                            );
+                        }
+                    }
+                }
+
+                //filter across vertical subblocks in macroblock
+                if do_subblock_filtering {
+                    if self.frame.filter_type {
+                        for x in (4usize..16 - 1).step_by(4) {
+                            for y in 0..16 {
+                                let y0 = mby * 16 + y;
+                                let x0 = mbx * 16 + x;
+
+                                loop_filter::simple_segment_horizontal(
+                                    sub_bedge_limit,
+                                    &mut self.recon_y[y0 * luma_w + x0 - 4..][..8],
+                                );
+                            }
+                        }
+                    } else {
+                        for x in (4usize..16 - 3).step_by(4) {
+                            for y in 0..16 {
+                                let y0 = mby * 16 + y;
+                                let x0 = mbx * 16 + x;
+
+                                loop_filter::subblock_filter_horizontal(
+                                    hev_threshold,
+                                    interior_limit,
+                                    sub_bedge_limit,
+                                    &mut self.recon_y[y0 * luma_w + x0 - 4..][..8],
+                                );
+                            }
+                        }
+
+                        for y in 0usize..8 {
+                            let y0 = mby * 8 + y;
+                            let x0 = mbx * 8 + 4;
+
+                            loop_filter::subblock_filter_horizontal(
+                                hev_threshold,
+                                interior_limit,
+                                sub_bedge_limit,
+                                &mut self.recon_u[y0 * chroma_w + x0 - 4..][..8],
+                            );
+
+                            loop_filter::subblock_filter_horizontal(
+                                hev_threshold,
+                                interior_limit,
+                                sub_bedge_limit,
+                                &mut self.recon_v[y0 * chroma_w + x0 - 4..][..8],
+                            );
+                        }
+                    }
+                }
+
+                //filter across top of macroblock
+                if mby > 0 {
+                    if self.frame.filter_type {
+                        for x in 0usize..16 {
+                            let y0 = mby * 16;
+                            let x0 = mbx * 16 + x;
+
+                            loop_filter::simple_segment_vertical(
+                                mbedge_limit,
+                                &mut self.recon_y[..],
+                                y0 * luma_w + x0,
+                                luma_w,
+                            );
+                        }
+                    } else {
+                        //if bottom macroblock, can only filter if there is 3 pixels below
+                        for x in 0usize..16 {
+                            let y0 = mby * 16;
+                            let x0 = mbx * 16 + x;
+
+                            loop_filter::macroblock_filter_vertical(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_y[..],
+                                y0 * luma_w + x0,
+                                luma_w,
+                            );
+                        }
+
+                        for x in 0usize..8 {
+                            let y0 = mby * 8;
+                            let x0 = mbx * 8 + x;
+
+                            loop_filter::macroblock_filter_vertical(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_u[..],
+                                y0 * chroma_w + x0,
+                                chroma_w,
+                            );
+                            loop_filter::macroblock_filter_vertical(
+                                hev_threshold,
+                                interior_limit,
+                                mbedge_limit,
+                                &mut self.recon_v[..],
+                                y0 * chroma_w + x0,
+                                chroma_w,
+                            );
+                        }
+                    }
+                }
+
+                //filter across horizontal subblock edges within the macroblock
+                if do_subblock_filtering {
+                    if self.frame.filter_type {
+                        for y in (4usize..16 - 1).step_by(4) {
+                            for x in 0..16 {
+                                let y0 = mby * 16 + y;
+                                let x0 = mbx * 16 + x;
+
+                                loop_filter::simple_segment_vertical(
+                                    sub_bedge_limit,
+                                    &mut self.recon_y[..],
+                                    y0 * luma_w + x0,
+                                    luma_w,
+                                );
+                            }
+                        }
+                    } else {
+                        for y in (4usize..16 - 3).step_by(4) {
+                            for x in 0..16 {
+                                let y0 = mby * 16 + y;
+                                let x0 = mbx * 16 + x;
+
+                                loop_filter::subblock_filter_vertical(
+                                    hev_threshold,
+                                    interior_limit,
+                                    sub_bedge_limit,
+                                    &mut self.recon_y[..],
+                                    y0 * luma_w + x0,
+                                    luma_w,
+                                );
+                            }
+                        }
+
+                        for x in 0..8 {
+                            let y0 = mby * 8 + 4;
+                            let x0 = mbx * 8 + x;
+
+                            loop_filter::subblock_filter_vertical(
+                                hev_threshold,
+                                interior_limit,
+                                sub_bedge_limit,
+                                &mut self.recon_u[..],
+                                y0 * chroma_w + x0,
+                                chroma_w,
+                            );
+
+                            loop_filter::subblock_filter_vertical(
+                                hev_threshold,
+                                interior_limit,
+                                sub_bedge_limit,
+                                &mut self.recon_v[..],
+                                y0 * chroma_w + x0,
+                                chroma_w,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The four "whole macroblock" luma prediction modes considered by RD
@@ -1549,6 +1976,9 @@ impl<W: Write> Vp8Encoder<W> {
             chroma_mode,
             segment_id: Some(segment_id as usize),
             coeffs_skipped,
+            // Not knowable until reconstruction - see this field's doc
+            // comment. `encode_image`'s real pass fills in the true value.
+            non_zero_dct: false,
         }
     }
 
@@ -1567,11 +1997,14 @@ impl<W: Write> Vp8Encoder<W> {
         let y_with_border = self.get_predicted_luma_block_16x16(luma_mode, mbx, mby);
         let luma_blocks = self.get_luma_blocks_from_predicted_16x16(&y_with_border, mbx, mby);
         let mut coeffs = self.get_luma_block_coeffs_16x16(luma_blocks, segment);
-        let dequantized_blocks =
+        // This trial doesn't need the non_zero_dct flags - only the real
+        // reconstruction pass (`transform_luma_block`) does, for the loop
+        // filter's `do_subblock_filtering` decision.
+        let (dequantized_blocks, _non_zero_dct) =
             self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs, segment);
 
         // Reconstruct into a copy of the predicted block so this trial never
-        // touches `self.top_border_y` / `self.left_border_y`.
+        // touches `self.recon_y`.
         let mut recon = y_with_border;
         for y in 0usize..4 {
             for x in 0usize..4 {
@@ -1657,13 +2090,7 @@ impl<W: Write> Vp8Encoder<W> {
         let mbw = self.macroblock_width;
         let width = usize::from(mbw * 16);
 
-        let mut y_with_border = create_border_luma(
-            mbx,
-            mby,
-            mbw.into(),
-            &self.top_border_y,
-            &self.left_border_y,
-        );
+        let mut y_with_border = create_border_luma_from_plane(mbx, mby, mbw.into(), &self.recon_y);
 
         // Running B_PRED context, local copies of `self.top_b_pred` /
         // `self.left_b_pred` updated as sub-blocks are chosen - mirrors
@@ -1837,20 +2264,8 @@ impl<W: Write> Vp8Encoder<W> {
         mby: usize,
         segment: &Segment,
     ) -> (i64, i64, ChromaCoeffs, ChromaCoeffs) {
-        let mut predicted_u = self.get_predicted_chroma_block(
-            chroma_mode,
-            mbx,
-            mby,
-            &self.top_border_u,
-            &self.left_border_u,
-        );
-        let mut predicted_v = self.get_predicted_chroma_block(
-            chroma_mode,
-            mbx,
-            mby,
-            &self.top_border_v,
-            &self.left_border_v,
-        );
+        let mut predicted_u = self.get_predicted_chroma_block(chroma_mode, mbx, mby, &self.recon_u);
+        let mut predicted_v = self.get_predicted_chroma_block(chroma_mode, mbx, mby, &self.recon_v);
 
         let u_blocks =
             self.get_chroma_blocks_from_predicted(&predicted_u, &self.frame.ubuf, mbx, mby);
@@ -1860,8 +2275,10 @@ impl<W: Write> Vp8Encoder<W> {
         let u_coeffs = self.get_chroma_block_coeffs(u_blocks, segment);
         let v_coeffs = self.get_chroma_block_coeffs(v_blocks, segment);
 
-        let dequantized_u = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs, segment);
-        let dequantized_v = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs, segment);
+        // This trial doesn't need the non_zero_dct flags - see the
+        // equivalent note in `trial_luma_16x16`.
+        let (dequantized_u, _) = self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs, segment);
+        let (dequantized_v, _) = self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs, segment);
 
         for y in 0usize..2 {
             for x in 0usize..2 {
@@ -1943,9 +2360,6 @@ impl<W: Write> Vp8Encoder<W> {
         for mby in 0..self.macroblock_height {
             self.left_complexity = Complexity::default();
             self.left_b_pred = [IntraMode::default(); 4];
-            self.left_border_y = [129u8; 16 + 1];
-            self.left_border_u = [129u8; 8 + 1];
-            self.left_border_v = [129u8; 8 + 1];
 
             for mbx in 0..self.macroblock_width {
                 let info = self.choose_macroblock_info(mbx.into(), mby.into());
@@ -2001,9 +2415,6 @@ impl<W: Write> Vp8Encoder<W> {
         for mby in 0..self.macroblock_height {
             self.left_complexity = Complexity::default();
             self.left_b_pred = [IntraMode::default(); 4];
-            self.left_border_y = [129u8; 16 + 1];
-            self.left_border_u = [129u8; 8 + 1];
-            self.left_border_v = [129u8; 8 + 1];
 
             for mbx in 0..self.macroblock_width {
                 let mbx = usize::from(mbx);
@@ -2015,8 +2426,8 @@ impl<W: Write> Vp8Encoder<W> {
                 );
                 self.advance_bpred_context(&info, mbx);
 
-                let y_block_data = self.transform_luma_block(mbx, mby, &info);
-                let (u_block_data, v_block_data) = self.transform_chroma_blocks(mbx, mby, &info);
+                let (y_block_data, _) = self.transform_luma_block(mbx, mby, &info);
+                let (u_block_data, v_block_data, _) = self.transform_chroma_blocks(mbx, mby, &info);
 
                 if info.coeffs_skipped {
                     // matches `encode_image`'s handling of a skipped
@@ -2228,6 +2639,14 @@ impl<W: Write> Vp8Encoder<W> {
         let mb_height = height.div_ceil(16);
         self.macroblock_width = mb_width;
         self.macroblock_height = mb_height;
+
+        // choosing the quantization quality based on the quality passed in
+        if lossy_quality > 100 {
+            panic!("lossy quality must be between 0 and 100");
+        }
+
+        let quant_index: u8 = (127 - u16::from(lossy_quality) * 127 / 100) as u8;
+
         self.frame = Frame {
             width,
             height,
@@ -2243,50 +2662,31 @@ impl<W: Write> Vp8Encoder<W> {
             pixel_type: 0,
 
             filter_type: false,
-            // MUST stay 0 until the encoder applies the loop filter to its
-            // own reconstruction.
-            //
-            // VP8's loop filter is *in-loop*: the decoder filters each
-            // reconstructed macroblock before later macroblocks predict from
-            // it. This encoder never does - `loop_filter::` is called only
-            // from the decoder, in `lossy/mod.rs` - so it predicts from
-            // unfiltered pixels while the decoder predicts from filtered
-            // ones. Signalling a non-zero level guarantees encoder/decoder
-            // drift, and the drift grows with the level.
-            //
-            // This was hardcoded to 63, the maximum, which maximised it.
-            // Measured with examples/rd_eval.rs on six Kodak images at three
-            // DSSIM targets, size relative to libwebp (lower is better):
-            //
-            //     image      <=0.0150        <=0.0080        <=0.0035
-            //     kodim01  1.51 -> 1.38    1.64 -> 1.58    1.97 -> 1.97
-            //     kodim02  1.57 -> 1.57    1.51 -> 1.45    2.03 -> 1.71
-            //     kodim03  1.89 -> 1.89    1.92 -> 1.92    2.19 -> 2.19
-            //     kodim05  2.25 -> 2.09    2.41 -> 2.25    2.65 -> 2.53
-            //     kodim13  1.99 -> 1.86    2.09 -> 2.09    2.33 -> 2.20
-            //     kodim19  1.74 -> 1.69    1.79 -> 1.79    2.10 -> 1.97
-            //
-            // Mean -4.0%, median -3.8%, best -15.8%, and worse on 0 of 18
-            // points. A monotonic sweep (0, 8, 16, 32, 63) confirms the cost
-            // rises with the level, which is the drift signature rather than
-            // a quality trade.
-            //
-            // The real fix is to filter the reconstruction here and then
-            // derive a level from the quantiser the way libwebp does; that
-            // should beat 0, because the filter exists to help prediction.
-            // Until then 0 is the only value that is not actively wrong.
-            filter_level: 0,
+            // image-resizer#137: derived from the same quantiser index
+            // every segment's own quantiser is built from
+            // (`derive_filter_level`), then actually applied to the
+            // encoder's own reconstruction by `apply_loop_filter` (called
+            // from `encode_image`, after every macroblock has been
+            // reconstructed - mirroring `Vp8Decoder::loop_filter`'s own
+            // separate, whole-frame pass) before this frame's bitstream is
+            // finalised. Previously hardcoded to 0: the loop filter is
+            // in-loop with respect to becoming a reference/display frame
+            // (see `apply_loop_filter`'s doc comment for why that does
+            // *not* mean intra prediction itself was ever at risk here),
+            // and this encoder used to never apply it to its own
+            // reconstruction at all, so any nonzero level it signalled
+            // was purely a post-processing blur the RD search never
+            // accounted for - measured to *cost* size at matched quality
+            // (examples/rd_eval.rs, six Kodak images, three DSSIM targets:
+            // disabling it entirely bought -4.0% mean / -3.8% median size,
+            // worse on 0 of 18 points). Actually applying the filter here
+            // is what makes signalling a nonzero level correct rather than
+            // just less-wrong.
+            filter_level: derive_filter_level(quant_index),
             sharpness_level: 7,
         };
 
         self.token_probs = COEFF_PROBS;
-
-        // choosing the quantization quality based on the quality passed in
-        if lossy_quality > 100 {
-            panic!("lossy quality must be between 0 and 100");
-        }
-
-        let quant_index: u8 = (127 - u16::from(lossy_quality) * 127 / 100) as u8;
 
         self.quantization_indices = QuantizationIndices {
             yac_abs: quant_index,
@@ -2335,18 +2735,22 @@ impl<W: Write> Vp8Encoder<W> {
     /// other, or into the real pass that follows.
     fn reset_frame_state(&mut self) {
         let mb_width = self.macroblock_width;
+        let mb_height = self.macroblock_height;
 
         self.top_complexity = vec![Complexity::default(); usize::from(mb_width)];
         self.top_b_pred = vec![IntraMode::default(); 4 * usize::from(mb_width)];
         self.left_b_pred = [IntraMode::default(); 4];
 
-        self.left_border_y = [129u8; 16 + 1];
-        self.left_border_u = [129u8; 8 + 1];
-        self.left_border_v = [129u8; 8 + 1];
-
-        self.top_border_y = vec![127u8; usize::from(mb_width) * 16 + 4];
-        self.top_border_u = vec![127u8; usize::from(mb_width) * 8];
-        self.top_border_v = vec![127u8; usize::from(mb_width) * 8];
+        // Every read of these planes (via `create_border_luma_from_plane` /
+        // `create_border_chroma_from_plane`) is gated by an `mbx == 0` /
+        // `mby == 0` check that never touches the plane at all, so the
+        // fill value here is never actually observed - see those
+        // functions' doc comments. Zero-filling (rather than 127/129, the
+        // old caches' reset values) is simplest and makes an accidental
+        // unguarded read obviously wrong instead of silently plausible.
+        self.recon_y = vec![0u8; usize::from(mb_width) * 16 * usize::from(mb_height) * 16];
+        self.recon_u = vec![0u8; usize::from(mb_width) * 8 * usize::from(mb_height) * 8];
+        self.recon_v = vec![0u8; usize::from(mb_width) * 8 * usize::from(mb_height) * 8];
     }
 
     // this is for all the luma modes except B
@@ -2360,13 +2764,7 @@ impl<W: Write> Vp8Encoder<W> {
 
         let mbw = self.macroblock_width;
 
-        let mut y_with_border = create_border_luma(
-            mbx,
-            mby,
-            mbw.into(),
-            &self.top_border_y,
-            &self.left_border_y,
-        );
+        let mut y_with_border = create_border_luma_from_plane(mbx, mby, mbw.into(), &self.recon_y);
 
         // do the prediction
         match luma_mode {
@@ -2454,12 +2852,23 @@ impl<W: Write> Vp8Encoder<W> {
         }
     }
 
+    /// Also returns, per luma sub-block, whether it contributes a nonzero
+    /// coefficient to `MacroblockInfo::non_zero_dct` - mirroring
+    /// `Vp8Decoder::read_residual_data`'s `if block[0] != 0 || n` check
+    /// (`lossy/mod.rs`) for the Y2 case: `block[0]` there is exactly
+    /// `coeffs.y2_coeffs[k]` after the IWHT below (the decoder dequantizes
+    /// then IWHTs Y2 the same way), and `n` is "this sub-block has a
+    /// nonzero AC coefficient", checked here on `luma_block[1..]` right
+    /// after dequantizing it (and before the IDCT below turns it from a
+    /// frequency- into a spatial-domain block) - dequantizing never changes
+    /// zero-ness, since `segment.yac`/`y2ac`/`y2dc` are always nonzero.
     fn get_dequantized_blocks_from_coeffs_luma_16x16(
         &self,
         coeffs: &mut Luma16x16Coeffs,
         segment: &Segment,
-    ) -> [i32; 16 * 16] {
+    ) -> ([i32; 16 * 16], [bool; 16]) {
         let mut dequantized_luma_residue = [0i32; 16 * 16];
+        let mut non_zero_dct = [false; 16];
 
         for (k, y2_coeff) in coeffs.y2_coeffs.iter_mut().enumerate() {
             let quant = if k > 0 { segment.y2ac } else { segment.y2dc };
@@ -2473,6 +2882,8 @@ impl<W: Write> Vp8Encoder<W> {
                 *y_value *= i32::from(segment.yac);
             }
 
+            non_zero_dct[k] = coeffs.y2_coeffs[k] != 0 || luma_block[1..].iter().any(|&v| v != 0);
+
             luma_block[0] = coeffs.y2_coeffs[k];
 
             transform::idct4x4(luma_block);
@@ -2480,7 +2891,7 @@ impl<W: Write> Vp8Encoder<W> {
             dequantized_luma_residue[k * 16..][..16].copy_from_slice(luma_block);
         }
 
-        dequantized_luma_residue
+        (dequantized_luma_residue, non_zero_dct)
     }
 
     // Transforms the luma macroblock in the following ways
@@ -2502,12 +2913,17 @@ impl<W: Write> Vp8Encoder<W> {
     // writes for later macroblocks to predict from would silently diverge
     // from what a real decoder reconstructs, since the decoder always
     // dequantizes with the segment id actually written in the header.
+    ///
+    /// Also returns `non_zero_dct` (see `MacroblockInfo::non_zero_dct`'s
+    /// doc comment): whether any luma sub-block of this macroblock has a
+    /// nonzero coefficient, mirroring `Vp8Decoder::read_residual_data`'s
+    /// `mb.non_zero_dct`.
     fn transform_luma_block(
         &mut self,
         mbx: usize,
         mby: usize,
         macroblock_info: &MacroblockInfo,
-    ) -> [i32; 16 * 16] {
+    ) -> ([i32; 16 * 16], bool) {
         let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
 
         if macroblock_info.luma_mode == LumaMode::B {
@@ -2527,8 +2943,9 @@ impl<W: Write> Vp8Encoder<W> {
 
         // now we're essentially applying the same functions as the decoder in order to ensure
         // that the border is the same as the one used for the decoder in the same macroblock
-        let dequantized_blocks =
+        let (dequantized_blocks, non_zero_dct_per_block) =
             self.get_dequantized_blocks_from_coeffs_luma_16x16(&mut coeffs, &segment);
+        let non_zero_dct = non_zero_dct_per_block.iter().any(|&v| v);
 
         // re-use the y_with_border from earlier since the prediction is still valid
         // applies the same thing as the decoder so that the border will line up
@@ -2544,16 +2961,27 @@ impl<W: Write> Vp8Encoder<W> {
             }
         }
 
-        // set borders from values
-        for (y, border_value) in self.left_border_y.iter_mut().enumerate() {
-            *border_value = y_with_border[y * LUMA_STRIDE + 16];
-        }
+        self.write_luma_recon(mbx, mby, &y_with_border);
 
-        for (x, border_value) in self.top_border_y[mbx * 16..][..16].iter_mut().enumerate() {
-            *border_value = y_with_border[16 * LUMA_STRIDE + x + 1];
-        }
+        (luma_blocks, non_zero_dct)
+    }
 
-        luma_blocks
+    /// Writes a just-reconstructed macroblock's 16x16 interior (i.e.
+    /// excluding the 1-pixel-plus border it was predicted from) from
+    /// `y_with_border` into `recon_y`, at that macroblock's position in the
+    /// full-frame plane - see `recon_y`'s doc comment. Replaces the old
+    /// per-macroblock `left_border_y`/`top_border_y` cache updates; shared
+    /// by `transform_luma_block` (16x16 modes) and
+    /// `transform_luma_blocks_4x4` (B_PRED), which both reconstruct into
+    /// the same `[u8; LUMA_BLOCK_SIZE]` border-buffer shape (stride
+    /// `LUMA_STRIDE`) before calling this.
+    fn write_luma_recon(&mut self, mbx: usize, mby: usize, y_with_border: &[u8; LUMA_BLOCK_SIZE]) {
+        let luma_width = usize::from(self.macroblock_width) * 16;
+        for y in 0..16 {
+            let src = (1 + y) * LUMA_STRIDE + 1;
+            let dst = (mby * 16 + y) * luma_width + mbx * 16;
+            self.recon_y[dst..dst + 16].copy_from_slice(&y_with_border[src..src + 16]);
+        }
     }
 
     // this is for transforming the luma blocks for each subblock independently
@@ -2564,19 +2992,24 @@ impl<W: Write> Vp8Encoder<W> {
         mbx: usize,
         mby: usize,
         segment: &Segment,
-    ) -> [i32; 16 * 16] {
+    ) -> ([i32; 16 * 16], bool) {
         let mut luma_blocks = [0i32; 16 * 16];
         let stride = 1usize + 16 + 4;
         let mbw = self.macroblock_width;
         let width = usize::from(mbw * 16);
 
-        let mut y_with_border = create_border_luma(
-            mbx,
-            mby,
-            mbw.into(),
-            &self.top_border_y,
-            &self.left_border_y,
-        );
+        let mut y_with_border = create_border_luma_from_plane(mbx, mby, mbw.into(), &self.recon_y);
+
+        // Mirrors `Vp8Decoder::read_residual_data`'s `mb.non_zero_dct`
+        // (`lossy/mod.rs`): true iff any of this macroblock's 16 luma
+        // sub-blocks has a nonzero (dequantized, pre-IDCT) coefficient -
+        // B_PRED has no separate Y2 plane, so unlike the 16x16 path below
+        // every sub-block's own index 0 is a real coded DC term, not a
+        // placeholder. Dequantizing never changes zero-ness (multiplying by
+        // the always-nonzero `quant` factor), so checking the
+        // quantized-then-dequantized value is equivalent to checking the
+        // quantized value the decoder actually reads.
+        let mut non_zero_dct = false;
 
         for sby in 0usize..4 {
             for sbx in 0usize..4 {
@@ -2623,21 +3056,19 @@ impl<W: Write> Vp8Encoder<W> {
                     let quant = if index > 0 { segment.yac } else { segment.ydc };
                     *y_value = (*y_value / i32::from(quant)) * i32::from(quant);
                 }
+
+                if current_subblock.iter().any(|&v| v != 0) {
+                    non_zero_dct = true;
+                }
+
                 transform::idct4x4(&mut current_subblock);
                 add_residue(&mut y_with_border, &current_subblock, y0, x0, stride);
             }
         }
 
-        // set borders from values
-        for (y, border_value) in self.left_border_y.iter_mut().enumerate() {
-            *border_value = y_with_border[y * stride + 16];
-        }
+        self.write_luma_recon(mbx, mby, &y_with_border);
 
-        for (x, border_value) in self.top_border_y[mbx * 16..][..16].iter_mut().enumerate() {
-            *border_value = y_with_border[16 * stride + x + 1];
-        }
-
-        luma_blocks
+        (luma_blocks, non_zero_dct)
     }
 
     fn get_predicted_chroma_block(
@@ -2645,10 +3076,11 @@ impl<W: Write> Vp8Encoder<W> {
         chroma_mode: ChromaMode,
         mbx: usize,
         mby: usize,
-        top_border: &[u8],
-        left_border: &[u8],
+        recon_plane: &[u8],
     ) -> [u8; CHROMA_BLOCK_SIZE] {
-        let mut chroma_with_border = create_border_chroma(mbx, mby, top_border, left_border);
+        let mbw = self.macroblock_width;
+        let mut chroma_with_border =
+            create_border_chroma_from_plane(mbx, mby, mbw.into(), recon_plane);
 
         match chroma_mode {
             ChromaMode::DC => {
@@ -2739,16 +3171,26 @@ impl<W: Write> Vp8Encoder<W> {
         chroma_coeffs
     }
 
+    /// Also returns, per 4x4 chroma block, whether it contributes a
+    /// nonzero coefficient to `MacroblockInfo::non_zero_dct` - mirroring
+    /// `Vp8Decoder::read_residual_data`'s `if block[0] != 0 || n` check for
+    /// the `Plane::Chroma` case (`lossy/mod.rs`): unlike luma's Y2 split,
+    /// chroma has no separate DC plane, so index 0 here is a real coded DC
+    /// term like every other index - checked (dequantized, pre-IDCT)
+    /// exactly like `get_dequantized_blocks_from_coeffs_luma_16x16`'s AC
+    /// check, for the same reason (dequantizing never changes zero-ness).
     fn get_dequantized_blocks_from_coeffs_chroma(
         &self,
         chroma_coeffs: &ChromaCoeffs,
         segment: &Segment,
-    ) -> [i32; 16 * 4] {
+    ) -> ([i32; 16 * 4], [bool; 4]) {
         let mut dequantized_blocks = [0i32; 16 * 4];
+        let mut non_zero_dct = [false; 4];
 
-        for (coeffs_block, dequant_block) in chroma_coeffs
+        for ((coeffs_block, dequant_block), non_zero) in chroma_coeffs
             .chunks_exact(16)
             .zip(dequantized_blocks.chunks_exact_mut(16))
+            .zip(non_zero_dct.iter_mut())
         {
             for ((index, &coeff), dequant_value) in coeffs_block
                 .iter()
@@ -2763,18 +3205,23 @@ impl<W: Write> Vp8Encoder<W> {
                 *dequant_value = coeff * i32::from(quant);
             }
 
+            *non_zero = dequant_block.iter().any(|&v| v != 0);
+
             transform::idct4x4(dequant_block);
         }
 
-        dequantized_blocks
+        (dequantized_blocks, non_zero_dct)
     }
 
+    /// Also returns `non_zero_dct` (see `MacroblockInfo::non_zero_dct`'s
+    /// doc comment): whether any of the 4 U or 4 V chroma sub-blocks of
+    /// this macroblock has a nonzero coefficient.
     fn transform_chroma_blocks(
         &mut self,
         mbx: usize,
         mby: usize,
         macroblock_info: &MacroblockInfo,
-    ) -> ([i32; 16 * 4], [i32; 16 * 4]) {
+    ) -> ([i32; 16 * 4], [i32; 16 * 4], bool) {
         let stride = CHROMA_STRIDE;
         let chroma_mode = macroblock_info.chroma_mode;
         // Same segment `choose_macroblock_info` picked for this macroblock
@@ -2783,20 +3230,8 @@ impl<W: Write> Vp8Encoder<W> {
         // decision on this.
         let segment = self.segments[macroblock_info.segment_id.unwrap_or(0)];
 
-        let mut predicted_u = self.get_predicted_chroma_block(
-            chroma_mode,
-            mbx,
-            mby,
-            &self.top_border_u,
-            &self.left_border_u,
-        );
-        let mut predicted_v = self.get_predicted_chroma_block(
-            chroma_mode,
-            mbx,
-            mby,
-            &self.top_border_v,
-            &self.left_border_v,
-        );
+        let mut predicted_u = self.get_predicted_chroma_block(chroma_mode, mbx, mby, &self.recon_u);
+        let mut predicted_v = self.get_predicted_chroma_block(chroma_mode, mbx, mby, &self.recon_v);
 
         let u_blocks =
             self.get_chroma_blocks_from_predicted(&predicted_u, &self.frame.ubuf, mbx, mby);
@@ -2806,10 +3241,11 @@ impl<W: Write> Vp8Encoder<W> {
         let u_coeffs = self.get_chroma_block_coeffs(u_blocks, &segment);
         let v_coeffs = self.get_chroma_block_coeffs(v_blocks, &segment);
 
-        let quantized_u_residue =
+        let (quantized_u_residue, u_non_zero) =
             self.get_dequantized_blocks_from_coeffs_chroma(&u_coeffs, &segment);
-        let quantized_v_residue =
+        let (quantized_v_residue, v_non_zero) =
             self.get_dequantized_blocks_from_coeffs_chroma(&v_coeffs, &segment);
+        let non_zero_dct = u_non_zero.iter().any(|&v| v) || v_non_zero.iter().any(|&v| v);
 
         for y in 0usize..2 {
             for x in 0usize..2 {
@@ -2826,27 +3262,34 @@ impl<W: Write> Vp8Encoder<W> {
             }
         }
 
-        // set borders
-        for ((y, u_border_value), v_border_value) in self
-            .left_border_u
-            .iter_mut()
-            .enumerate()
-            .zip(self.left_border_v.iter_mut())
-        {
-            *u_border_value = predicted_u[y * stride + 8];
-            *v_border_value = predicted_v[y * stride + 8];
-        }
+        self.write_chroma_recon(mbx, mby, &predicted_u, &predicted_v);
 
-        for ((x, u_border_value), v_border_value) in self.top_border_u[mbx * 8..][..8]
-            .iter_mut()
-            .enumerate()
-            .zip(self.top_border_v[mbx * 8..][..8].iter_mut())
-        {
-            *u_border_value = predicted_u[8 * stride + x + 1];
-            *v_border_value = predicted_v[8 * stride + x + 1];
-        }
+        (u_blocks, v_blocks, non_zero_dct)
+    }
 
-        (u_blocks, v_blocks)
+    /// Writes a just-reconstructed macroblock's 8x8 chroma interior from
+    /// `predicted_u`/`predicted_v` (each still carrying the 1-pixel border
+    /// they were predicted from) into `recon_u`/`recon_v`, at that
+    /// macroblock's position in the full-frame planes - see `recon_y`'s
+    /// doc comment (the chroma planes are sized and indexed the same way,
+    /// just at 8x8 instead of 16x16 per macroblock). Replaces the old
+    /// per-macroblock `left_border_u`/`left_border_v`/`top_border_u`/
+    /// `top_border_v` cache updates.
+    fn write_chroma_recon(
+        &mut self,
+        mbx: usize,
+        mby: usize,
+        predicted_u: &[u8; CHROMA_BLOCK_SIZE],
+        predicted_v: &[u8; CHROMA_BLOCK_SIZE],
+    ) {
+        let chroma_width = usize::from(self.macroblock_width) * 8;
+        let stride = CHROMA_STRIDE;
+        for y in 0..8 {
+            let src = (1 + y) * stride + 1;
+            let dst = (mby * 8 + y) * chroma_width + mbx * 8;
+            self.recon_u[dst..dst + 8].copy_from_slice(&predicted_u[src..src + 8]);
+            self.recon_v[dst..dst + 8].copy_from_slice(&predicted_v[src..src + 8]);
+        }
     }
 }
 
@@ -2905,6 +3348,7 @@ mod tests {
                 chroma_mode: ChromaMode::DC,
                 segment_id: Some(0),
                 coeffs_skipped: false,
+                non_zero_dct: false,
             },
             MacroblockInfo {
                 luma_mode: LumaMode::TM,
@@ -2912,6 +3356,7 @@ mod tests {
                 chroma_mode: ChromaMode::V,
                 segment_id: Some(1),
                 coeffs_skipped: true,
+                non_zero_dct: false,
             },
             MacroblockInfo {
                 luma_mode: LumaMode::B,
@@ -2936,6 +3381,7 @@ mod tests {
                 chroma_mode: ChromaMode::H,
                 segment_id: Some(2),
                 coeffs_skipped: false,
+                non_zero_dct: false,
             },
             MacroblockInfo {
                 luma_mode: LumaMode::B,
@@ -2943,6 +3389,7 @@ mod tests {
                 chroma_mode: ChromaMode::TM,
                 segment_id: Some(3),
                 coeffs_skipped: false,
+                non_zero_dct: false,
             },
             MacroblockInfo {
                 luma_mode: LumaMode::H,
@@ -2950,6 +3397,7 @@ mod tests {
                 chroma_mode: ChromaMode::DC,
                 segment_id: Some(0),
                 coeffs_skipped: false,
+                non_zero_dct: false,
             },
         ]
     }
@@ -3062,16 +3510,23 @@ mod tests {
         for mby in 0..encoder.macroblock_height {
             encoder.left_complexity = Complexity::default();
             encoder.left_b_pred = [IntraMode::default(); 4];
-            encoder.left_border_y = [129u8; 16 + 1];
-            encoder.left_border_u = [129u8; 8 + 1];
-            encoder.left_border_v = [129u8; 8 + 1];
 
             for mbx in 0..encoder.macroblock_width {
                 let info = encoder.choose_macroblock_info(mbx.into(), mby.into());
                 encoder.write_macroblock_header(&info, mbx.into());
 
-                let y_block_data = encoder.transform_luma_block(mbx.into(), mby.into(), &info);
-                let (u_block_data, v_block_data) =
+                // `non_zero_dct` deliberately left at its default `false`
+                // here (discarding both transform calls' second/third
+                // return values): it is not a mode-decision field (it can
+                // only be known after reconstruction, see its doc comment),
+                // so - like pass 1 (`count_skipped_macroblocks`) and pass 2
+                // (`collect_token_counts`), neither of which populate it
+                // either - this function's `MacroblockInfo`s stay
+                // comparable via `==` against theirs in
+                // `all_three_passes_agree_on_mode_decisions` below, which is
+                // about mode decisions specifically, not this diagnostic.
+                let (y_block_data, _) = encoder.transform_luma_block(mbx.into(), mby.into(), &info);
+                let (u_block_data, v_block_data, _) =
                     encoder.transform_chroma_blocks(mbx.into(), mby.into(), &info);
 
                 if !info.coeffs_skipped {
@@ -3158,6 +3613,202 @@ mod tests {
 
             assert_eq!(pass1, pass2, "fixture '{name}': pass 1/2 disagreed");
             assert_eq!(pass1, pass3, "fixture '{name}': pass 1/3 disagreed");
+        }
+    }
+
+    /// Largest absolute per-element difference between two equal-length
+    /// byte buffers - used below to report exactly how far
+    /// `apply_loop_filter`'s drift is from zero, rather than just
+    /// pass/fail.
+    fn max_abs_diff(a: &[u8], b: &[u8]) -> u8 {
+        assert_eq!(a.len(), b.len(), "compared buffers have different lengths");
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x.abs_diff(y))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// image-resizer#137 stage 2's core verification. For several fixtures
+    /// and qualities (chosen to span `derive_filter_level`'s output from 0
+    /// up through a real nonzero level), this:
+    ///
+    /// 1. runs `Vp8Encoder::encode_image` directly (not through the public
+    ///    `WebPEncoder` API) so the test can read `recon_y`/`recon_u`/
+    ///    `recon_v` afterwards - the encoder's own simulated *post-filter*
+    ///    reconstruction, i.e. what `apply_loop_filter` computed `should`
+    ///    be the result of decoding the bitstream just written;
+    /// 2. decodes that same raw VP8 bitstream with this crate's own
+    ///    `Vp8Decoder` and compares its `Frame::ybuf`/`ubuf`/`vbuf`
+    ///    directly against `recon_y`/`recon_u`/`recon_v` - no colour-space
+    ///    conversion involved, so any nonzero difference here is purely
+    ///    `apply_loop_filter` disagreeing with `Vp8Decoder::loop_filter`;
+    /// 3. separately encodes the *same* source pixels through the public
+    ///    `WebPEncoder` API (a second, but deterministic and therefore
+    ///    byte-identical, encode of the same input) into a real WebP
+    ///    container, decodes that with libwebp (`webp::Decoder`, already a
+    ///    dev-dependency), and compares its decoded RGB against the same
+    ///    `recon_y`/`recon_u`/`recon_v` converted to RGB via `Frame::
+    ///    fill_rgb` with `UpsamplingMethod::Bilinear` (`WebPDecoder`'s own
+    ///    default, matching libwebp's default "fancy" upsampler).
+    ///
+    /// Both comparisons are expected to be **exactly** zero: that is the
+    /// whole point of mirroring `Vp8Decoder::loop_filter` in
+    /// `apply_loop_filter` rather than approximating it - see that
+    /// function's doc comment. Every fixture/quality's maximum absolute
+    /// difference is printed (`--nocapture`) before the asserts that would
+    /// fail on it, so a real regression here reports exact numbers instead
+    /// of a bare "assertion failed".
+    #[test]
+    fn loop_filter_drift() {
+        use std::io::Cursor;
+
+        struct Fixture {
+            name: &'static str,
+            width: u16,
+            height: u16,
+            pixels: Vec<u8>,
+        }
+
+        let fixtures = [
+            Fixture {
+                name: "flat",
+                width: 48,
+                height: 32,
+                pixels: flat_rgb(48, 32),
+            },
+            // Non-multiple-of-16 on both axes, so the filter also runs
+            // across the partial edge macroblocks the reconstruction
+            // planes are sized for.
+            Fixture {
+                name: "noisy",
+                width: 67,
+                height: 51,
+                pixels: noisy_rgb(67, 51),
+            },
+            Fixture {
+                name: "mixed",
+                width: 96,
+                height: 64,
+                pixels: mixed_rgb(96, 64),
+            },
+        ];
+
+        // 100 forces `derive_filter_level` to 0 (see
+        // `tests/lossy_loop_filter_stage1_byte_identity.rs`'s doc comment)
+        // - included as a sanity baseline where `apply_loop_filter` is a
+        // no-op - alongside qualities that land on a genuinely nonzero
+        // level, which is what actually exercises the filter.
+        let qualities = [100u8, 85, 60, 30];
+
+        for fixture in &fixtures {
+            for &quality in &qualities {
+                let mut encoder = Vp8Encoder::new(Vec::new());
+                encoder
+                    .encode_image(
+                        &fixture.pixels,
+                        ColorType::Rgb8,
+                        fixture.width,
+                        fixture.height,
+                        quality,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("encode failed for '{}' @ q{quality}: {e}", fixture.name)
+                    });
+
+                let vp8_bytes = encoder.writer.clone();
+                let recon_y = encoder.recon_y.clone();
+                let recon_u = encoder.recon_u.clone();
+                let recon_v = encoder.recon_v.clone();
+                let filter_level = encoder.frame.filter_level;
+
+                // (2) this crate's own decoder, compared in YUV space -
+                // zero colour-space-conversion ambiguity.
+                let our_frame = super::super::Vp8Decoder::decode_frame(Cursor::new(vp8_bytes))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "this crate's decoder failed for '{}' @ q{quality}: {e}",
+                            fixture.name
+                        )
+                    });
+                let our_y_diff = max_abs_diff(&our_frame.ybuf, &recon_y);
+                let our_u_diff = max_abs_diff(&our_frame.ubuf, &recon_u);
+                let our_v_diff = max_abs_diff(&our_frame.vbuf, &recon_v);
+
+                // (3) libwebp, compared in RGB space via a second,
+                // deterministic encode through the public API.
+                let mut container = Vec::new();
+                let mut public_encoder = crate::WebPEncoder::new(&mut container);
+                let params = crate::EncoderParams {
+                    use_lossy: true,
+                    lossy_quality: quality,
+                    ..Default::default()
+                };
+                public_encoder.set_params(params);
+                public_encoder
+                    .encode(
+                        &fixture.pixels,
+                        u32::from(fixture.width),
+                        u32::from(fixture.height),
+                        crate::ColorType::Rgb8,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "public encode failed for '{}' @ q{quality}: {e}",
+                            fixture.name
+                        )
+                    });
+                let libwebp_decoded =
+                    webp::Decoder::new(&container).decode().unwrap_or_else(|| {
+                        panic!("libwebp failed to decode '{}' @ q{quality}", fixture.name)
+                    });
+
+                let recon_frame = Frame {
+                    width: fixture.width,
+                    height: fixture.height,
+                    ybuf: recon_y,
+                    ubuf: recon_u,
+                    vbuf: recon_v,
+                    ..Frame::default()
+                };
+                let mut recon_rgb =
+                    vec![0u8; usize::from(fixture.width) * usize::from(fixture.height) * 3];
+                recon_frame.fill_rgb(&mut recon_rgb, crate::UpsamplingMethod::Bilinear);
+
+                assert_eq!(
+                    libwebp_decoded.len(),
+                    recon_rgb.len(),
+                    "fixture '{}' @ q{quality}: libwebp decoded a different-sized buffer \
+                     ({} bytes) than the reconstruction-derived RGB buffer ({} bytes)",
+                    fixture.name,
+                    libwebp_decoded.len(),
+                    recon_rgb.len(),
+                );
+                let libwebp_diff = max_abs_diff(&libwebp_decoded, &recon_rgb);
+
+                eprintln!(
+                    "{} @ q{quality} (filter_level={filter_level}): max abs diff - our \
+                     decoder Y={our_y_diff} U={our_u_diff} V={our_v_diff}, libwebp RGB={libwebp_diff}",
+                    fixture.name,
+                );
+
+                assert_eq!(
+                    (our_y_diff, our_u_diff, our_v_diff),
+                    (0, 0, 0),
+                    "fixture '{}' @ q{quality} (filter_level={filter_level}): this crate's \
+                     own decoder diverged from the encoder's own post-filter reconstruction \
+                     (max abs diff Y={our_y_diff} U={our_u_diff} V={our_v_diff}) - \
+                     apply_loop_filter has drifted from Vp8Decoder::loop_filter",
+                    fixture.name,
+                );
+                assert_eq!(
+                    libwebp_diff, 0,
+                    "fixture '{}' @ q{quality} (filter_level={filter_level}): libwebp \
+                     diverged from the encoder's own post-filter reconstruction (max abs \
+                     diff, RGB space = {libwebp_diff})",
+                    fixture.name,
+                );
+            }
         }
     }
 }

@@ -316,13 +316,31 @@ const EXPECTED: &[(&str, usize, u64)] = &[
 ];
 
 /// `(fixture name, decoded pixel buffer byte length, FNV-1a 64 hash of the
-/// decoded pixel buffer)`. These fixtures are byte-for-byte identical
-/// (name, dimensions, color type, quality, pixel generator) to
-/// `tests/lossy_bpred_context_pixel_identity.rs`'s, and `EXPECTED` above
-/// already proved `7feed60`'s and (pre-#151) `da8181d`'s encoded bytes were
-/// identical for them - so the decoded-pixel reference values that file
-/// captured against `da8181d` apply here unchanged; see its top-level doc
-/// comment for exactly how they were captured.
+/// decoded pixel buffer)`, captured against `da8181d` (pre-#151) - see
+/// `tests/lossy_bpred_context_pixel_identity.rs`'s top-level doc comment for
+/// exactly how.
+///
+/// # image-resizer#137 superseded the pixel-hash half of this table
+///
+/// The loop filter (image-resizer#137 stage 2) now applies a generally
+/// nonzero `frame.filter_level`, derived from the quantiser
+/// (`derive_filter_level`), to the encoder's own reconstruction - and a
+/// real decoder applies the matching filter when it decodes this crate's
+/// output. That legitimately changes decoded pixels relative to this table
+/// (captured when the loop filter was unconditionally disabled) for any
+/// fixture whose quantiser derives a nonzero level - which is most of
+/// them, since none of the fixtures below use `lossy_quality: 100` (the
+/// one value guaranteed to derive a zero level - see
+/// `tests/lossy_loop_filter_stage1_byte_identity.rs`'s top-level doc
+/// comment). `byte_identity_matches_pre_cache_baseline` below no longer
+/// compares against the hash half of this table for that reason; it is
+/// kept only for the decoded-length sanity check and as a historical
+/// record of the da8181d baseline. The property this table used to prove -
+/// that decoded pixels are unaffected by *this specific* mode-decision-
+/// caching change - is now covered the way loop-filter-affected pixel
+/// output generally is: `Vp8Encoder::apply_loop_filter`'s own drift test
+/// (`src/lossy/encoder.rs`'s `tests` module), which checks pixels against
+/// the encoder's own reconstruction rather than a pre-#137 snapshot.
 const EXPECTED_PIXELS: &[(&str, usize, u64)] = &[
     ("flat_multiple16", 9216, 0xafc3bbf9d4331725),
     ("flat_nonmultiple16", 6201, 0x0eb251ad576ac798),
@@ -341,9 +359,12 @@ const EXPECTED_PIXELS: &[(&str, usize, u64)] = &[
 /// three passes) must not change what the encoder produces. Through
 /// image-resizer#150 that was checked byte-for-byte against `EXPECTED`; as
 /// of image-resizer#151 the encoded bytes legitimately differ (see this
-/// file's top-level doc comment), so this now decodes both the current
-/// output and checks it against `EXPECTED_PIXELS` - the pixel-level part of
-/// the original guarantee, which #151 preserves.
+/// file's top-level doc comment), so this decodes the current output and
+/// checks its *length* against `EXPECTED_PIXELS` (a truncated/malformed
+/// decode would still be a real regression). It deliberately no longer
+/// compares the pixel hash - see `EXPECTED_PIXELS`'s doc comment for why
+/// image-resizer#137 (the VP8 loop filter) legitimately moved that goalpost
+/// too, on top of #151.
 #[test]
 fn byte_identity_matches_pre_cache_baseline() {
     let fixtures = fixtures();
@@ -353,25 +374,22 @@ fn byte_identity_matches_pre_cache_baseline() {
         "fixture list changed size"
     );
 
-    for (fixture, &(expected_name, expected_decoded_len, expected_pixel_hash)) in
+    for (fixture, &(expected_name, expected_decoded_len, _expected_pixel_hash_pre_137)) in
         fixtures.iter().zip(EXPECTED_PIXELS.iter())
     {
         assert_eq!(fixture.name, expected_name, "fixture order changed");
 
         let bytes = encode(fixture);
         let decoded = decode(&bytes);
-        let actual_pixel_hash = fnv1a_64(&decoded);
 
         assert_eq!(
-            (decoded.len(), actual_pixel_hash),
-            (expected_decoded_len, expected_pixel_hash),
-            "fixture '{}' decoded to different pixels than the pre-cache baseline \
-             (decoded len {} vs expected {}, pixel hash {:016x} vs expected {:016x})",
+            decoded.len(),
+            expected_decoded_len,
+            "fixture '{}' decoded to a different-sized pixel buffer than the pre-cache \
+             baseline (decoded len {} vs expected {})",
             fixture.name,
             decoded.len(),
             expected_decoded_len,
-            actual_pixel_hash,
-            expected_pixel_hash,
         );
     }
 }

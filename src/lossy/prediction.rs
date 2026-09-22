@@ -73,6 +73,111 @@ pub(crate) fn create_border_luma(
     ws
 }
 
+/// Builds the same `[u8; LUMA_BLOCK_SIZE]` border-plus-interior buffer
+/// `create_border_luma` builds, but reads the top and left border pixels
+/// directly from a full-frame luma reconstruction plane (sized from the
+/// macroblock grid: `mbw * 16` columns, indexed `y * (mbw * 16) + x`,
+/// exactly like `Vp8Decoder`'s own `Frame::ybuf` and the encoder's
+/// `Vp8Encoder::recon_y`) instead of the incrementally maintained
+/// `top_border_y`/`left_border_y` caches `create_border_luma` was written
+/// against.
+///
+/// Used only by the encoder (image-resizer#137 stage 1): the decoder
+/// still uses `create_border_luma` with its own per-row caches, since it
+/// has no reason to maintain a second copy of every pixel it already keeps
+/// in `Frame::ybuf`. The encoder needs the opposite: it wants the *plane*
+/// to already exist (the loop filter added in stage 2 needs several rows of
+/// real reconstructed pixels on either side of a macroblock edge, which no
+/// 1-pixel border cache can supply - see `Vp8Encoder::recon_y`'s doc
+/// comment), so deriving the borders from that plane on demand, rather than
+/// maintaining both a plane *and* a duplicate set of border caches, is the
+/// simpler structure once the plane exists at all.
+///
+/// # Why this gives byte-identical results to the cache it replaces
+///
+/// Under raster-order encoding (`mbx` increasing within an `mby` row, `mby`
+/// increasing across rows - the order every caller in `encoder.rs` uses),
+/// by the time macroblock `(mbx, mby)` is reached:
+/// - row `mby * 16 - 1` of `plane` (this macroblock's neighbour above, and
+///   that neighbour's own neighbour to the right, for the 4 top-right
+///   pixels) is already fully written, because the entire `mby - 1` row was
+///   finished before this row started;
+/// - column `mbx * 16 - 1` of `plane` (this macroblock's neighbour to the
+///   left) is already fully written, because macroblock `(mbx - 1, mby)`
+///   was already reconstructed earlier in this same row.
+///
+/// That is exactly the data the old `top_border_y`/`left_border_y` caches
+/// held at the equivalent point in the old code (`top_border_y` persisted
+/// row to row, updated per-macroblock with that macroblock's own bottom
+/// row; `left_border_y` was reset to 129 per row and updated per-macroblock
+/// with that macroblock's own right column) - see
+/// `tests/lossy_loop_filter_stage1_byte_identity.rs` for the regression
+/// test asserting the two approaches agree.
+pub(crate) fn create_border_luma_from_plane(
+    mbx: usize,
+    mby: usize,
+    mbw: usize,
+    plane: &[u8],
+) -> [u8; LUMA_BLOCK_SIZE] {
+    let luma_width = mbw * 16;
+    let stride = LUMA_STRIDE;
+    let mut ws = [0u8; LUMA_BLOCK_SIZE];
+
+    // A: top border row (16 pixels directly above, plus 4 more to the
+    // top-right - replicated past the right edge of the frame, same as
+    // `create_border_luma`).
+    if mby == 0 {
+        for above in ws[1..stride].iter_mut() {
+            *above = 127;
+        }
+    } else {
+        let src_row = (mby * 16 - 1) * luma_width;
+        for i in 0..16 {
+            ws[1 + i] = plane[src_row + mbx * 16 + i];
+        }
+
+        if mbx == mbw - 1 {
+            let last = ws[16];
+            for above in &mut ws[17..stride] {
+                *above = last;
+            }
+        } else {
+            for i in 0..4 {
+                ws[17 + i] = plane[src_row + mbx * 16 + 16 + i];
+            }
+        }
+    }
+
+    for i in 17usize..stride {
+        ws[4 * stride + i] = ws[i];
+        ws[8 * stride + i] = ws[i];
+        ws[12 * stride + i] = ws[i];
+    }
+
+    // L: left border column (16 pixels immediately to the left).
+    if mbx == 0 {
+        for i in 0usize..16 {
+            ws[(i + 1) * stride] = 129;
+        }
+    } else {
+        let col = mbx * 16 - 1;
+        for i in 0usize..16 {
+            ws[(i + 1) * stride] = plane[(mby * 16 + i) * luma_width + col];
+        }
+    }
+
+    // P: the corner pixel, diagonally up-left of the macroblock.
+    ws[0] = if mby == 0 {
+        127
+    } else if mbx == 0 {
+        129
+    } else {
+        plane[(mby * 16 - 1) * luma_width + mbx * 16 - 1]
+    };
+
+    ws
+}
+
 pub(crate) const CHROMA_BLOCK_SIZE: usize = (8 + 1) * (8 + 1);
 pub(crate) const CHROMA_STRIDE: usize = 8 + 1;
 
@@ -117,6 +222,60 @@ pub(crate) fn create_border_chroma(
         129
     } else {
         left[0]
+    };
+
+    chroma_block
+}
+
+/// Chroma counterpart of `create_border_luma_from_plane` - see its doc
+/// comment for why this reads directly from a full-frame chroma
+/// reconstruction plane (`mbw * 8` columns, indexed `y * (mbw * 8) + x`)
+/// instead of the `top_border_u`/`top_border_v`/`left_border_u`/
+/// `left_border_v` caches `create_border_chroma` was written against, and
+/// why raster-order encoding makes the two give byte-identical results.
+/// Unlike luma, chroma prediction has no top-right lookahead pixels to
+/// replicate past the frame edge, so this is a direct copy of
+/// `create_border_chroma`'s shape with the source changed.
+pub(crate) fn create_border_chroma_from_plane(
+    mbx: usize,
+    mby: usize,
+    mbw: usize,
+    plane: &[u8],
+) -> [u8; CHROMA_BLOCK_SIZE] {
+    let chroma_width = mbw * 8;
+    let stride = CHROMA_STRIDE;
+    let mut chroma_block = [0u8; CHROMA_BLOCK_SIZE];
+
+    // above
+    if mby == 0 {
+        for above in chroma_block[1..stride].iter_mut() {
+            *above = 127;
+        }
+    } else {
+        let src_row = (mby * 8 - 1) * chroma_width;
+        for i in 0..8 {
+            chroma_block[1 + i] = plane[src_row + mbx * 8 + i];
+        }
+    }
+
+    // left
+    if mbx == 0 {
+        for y in 0usize..8 {
+            chroma_block[(y + 1) * stride] = 129;
+        }
+    } else {
+        let col = mbx * 8 - 1;
+        for y in 0usize..8 {
+            chroma_block[(y + 1) * stride] = plane[(mby * 8 + y) * chroma_width + col];
+        }
+    }
+
+    chroma_block[0] = if mby == 0 {
+        127
+    } else if mbx == 0 {
+        129
+    } else {
+        plane[(mby * 8 - 1) * chroma_width + mbx * 8 - 1]
     };
 
     chroma_block

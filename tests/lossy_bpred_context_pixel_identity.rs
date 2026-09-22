@@ -266,50 +266,54 @@ const EXPECTED: &[(&str, usize, usize, u64)] = &[
 
 /// The correctness bar for image-resizer#151: with the B_PRED entropy
 /// context now correctly tracked during the dry runs (and `mb_info_cache`
-/// extended to the real pass on top of that), decoded pixels must be
-/// bit-identical to what `da8181d` produced, and the encoded size must not
+/// extended to the real pass on top of that), decoded pixels were
+/// bit-identical to what `da8181d` produced, and the encoded size did not
 /// grow.
+///
+/// # image-resizer#137 superseded both halves of that guarantee
+///
+/// The loop filter (image-resizer#137 stage 2) applies a generally nonzero
+/// `frame.filter_level` (`derive_filter_level`, keyed off the quantiser) to
+/// the encoder's own reconstruction, and a real decoder applies the
+/// matching filter when decoding this crate's output - both legitimately
+/// change decoded pixels relative to `EXPECTED` (captured when the loop
+/// filter was unconditionally disabled), and change encoded size in
+/// whichever direction the filtered residual actually costs (the frame
+/// header alone now spends more bits signalling a nonzero level, sharpness
+/// and filter type, on top of whatever the filtered reconstruction changes
+/// about the residual itself) - "must not grow" is no longer a property
+/// this change preserves either. `EXPECTED`'s pixel hash and the old
+/// never-grows assertion are dropped for that reason; the decoded-length
+/// check remains (a truncated/malformed decode is still a real
+/// regression), and `Vp8Encoder::apply_loop_filter`'s own drift test
+/// (`src/lossy/encoder.rs`'s `tests` module) is what now covers "decoded
+/// pixels are what they should be" for loop-filter-affected output.
 #[test]
-fn bpred_context_fix_keeps_pixels_identical_and_does_not_grow() {
+fn bpred_context_fix_keeps_pixel_buffer_size_stable() {
     let fixtures = fixtures();
     assert_eq!(fixtures.len(), EXPECTED.len(), "fixture list changed size");
 
-    for (fixture, &(expected_name, old_len, expected_decoded_len, expected_pixel_hash)) in
+    for (fixture, &(expected_name, old_len, expected_decoded_len, _expected_pixel_hash_pre_137)) in
         fixtures.iter().zip(EXPECTED.iter())
     {
         assert_eq!(fixture.name, expected_name, "fixture order changed");
 
         let new_bytes = encode(fixture);
         let new_decoded = decode(&new_bytes);
-        let new_pixel_hash = fnv1a_64(&new_decoded);
-
-        assert!(
-            new_bytes.len() <= old_len,
-            "fixture '{}': encoded size grew ({} bytes vs da8181d's {} bytes) - the whole \
-             point of correcting the B_PRED entropy context is that the header's \
-             probabilities now describe the encode that actually happens, so this should \
-             shrink or stay the same, never grow",
-            fixture.name,
-            new_bytes.len(),
-            old_len,
-        );
 
         assert_eq!(
-            (new_decoded.len(), new_pixel_hash),
-            (expected_decoded_len, expected_pixel_hash),
-            "fixture '{}': decoded pixels changed relative to da8181d (decoded len {} vs \
-             expected {}, pixel hash {:016x} vs expected {:016x}) - mode decisions and \
-             coefficients must be unaffected by this change, only their entropy coding",
+            new_decoded.len(),
+            expected_decoded_len,
+            "fixture '{}': decoded to a different-sized pixel buffer than da8181d (decoded \
+             len {} vs expected {})",
             fixture.name,
             new_decoded.len(),
             expected_decoded_len,
-            new_pixel_hash,
-            expected_pixel_hash,
         );
 
         let old_to_new_pct = 100.0 * (new_bytes.len() as f64 - old_len as f64) / old_len as f64;
         eprintln!(
-            "{}: {} -> {} bytes ({:+.2}%), decoded pixels match da8181d exactly",
+            "{}: {} -> {} bytes ({:+.2}%)",
             fixture.name,
             old_len,
             new_bytes.len(),
