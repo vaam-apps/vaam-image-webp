@@ -1,5 +1,30 @@
 # Release Notes
 
+## vaam-image-webp
+
+This crate is a fork of upstream `image-webp`; see [README.md](README.md#relationship-to-upstream)
+for what it adds and how it relates to upstream. Its own version line starts
+below. The `Version 0.2.x` and earlier entries further down are upstream
+`image-webp`'s changelog, kept as-is for history and unaffected by anything
+in this section.
+
+### Version 0.1.0
+
+First release of `vaam-image-webp` as its own crate on crates.io. Forked from
+upstream `image-webp` (last synced against its `0.2.4` release plus
+unreleased `main`).
+
+Changes over upstream:
+ - Added a lossy (VP8) encoder: pure Rust, no C/C++ dependencies. Upstream's
+   `0.2.4` only encodes losslessly.
+ - Adaptive quantisation (VP8 segmentation) and RD-aware dry-run mode
+   decisions in the lossy encoder.
+ - Measured against libwebp on the 24-image Kodak suite: 1.17-1.21x file
+   size at matched DSSIM, ~2.7x encode time, and the decoder is 72/72
+   bit-exact.
+
+# Upstream Release Notes (image-webp)
+
 ### Version 0.2.4
 
 Changes:
