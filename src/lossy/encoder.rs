@@ -277,7 +277,7 @@ fn mode_decision_lambda(segment: &Segment) -> f64 {
 /// short of the maximum (63) - a level of 63 unconditionally is exactly the
 /// failure mode this replaces - while the finest quantisers (where blocking
 /// is barely visible to begin with) stay at or near 0.
-const FILTER_LEVEL_DIVISOR: u32 = 4;
+const FILTER_LEVEL_DIVISOR: u32 = 8;
 
 /// Derives the frame-level VP8 loop filter strength (`frame.filter_level`,
 /// 9.4/15) from the base luma-AC quantiser index (`quant_index`, 0..=127 -
