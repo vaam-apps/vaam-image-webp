@@ -3095,6 +3095,11 @@ mod tests {
         infos
     }
 
+    /// `(fixture name, width, height, lossy quality, pixel generator)` - just
+    /// named to keep `all_three_passes_agree_on_mode_decisions` below under
+    /// clippy's `type_complexity` threshold.
+    type ModeAgreementFixture = (&'static str, u16, u16, u8, fn(u16, u16) -> Vec<u8>);
+
     /// The correctness claim that justifies extending `mb_info_cache` to
     /// `encode_image`'s real pass (image-resizer#151): with
     /// `advance_bpred_context` keeping the two dry runs'
@@ -3112,11 +3117,6 @@ mod tests {
     /// the real pass would decide something other than what `encode_image`
     /// now reads from the cache, i.e. the cache extension would silently
     /// change the encoded bitstream.
-    /// `(fixture name, width, height, lossy quality, pixel generator)` - just
-    /// named to keep `all_three_passes_agree_on_mode_decisions` below under
-    /// clippy's `type_complexity` threshold.
-    type ModeAgreementFixture = (&'static str, u16, u16, u8, fn(u16, u16) -> Vec<u8>);
-
     #[test]
     fn all_three_passes_agree_on_mode_decisions() {
         let fixtures: [ModeAgreementFixture; 3] = [
